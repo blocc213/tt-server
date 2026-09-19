@@ -1,0 +1,93 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>TauriTavern</title>
+    <style>
+        body {
+            background: rgb(36, 36, 37);
+            color: #e8e8e8;
+            font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            min-height: 100vh;
+            margin: 0;
+        }
+
+        form {
+            display: flex;
+            flex-direction: column;
+            gap: 12px;
+            width: min(320px, 90vw);
+        }
+
+        h1 {
+            font-size: 1.2rem;
+            font-weight: 600;
+            margin: 0 0 4px;
+        }
+
+        input,
+        button {
+            font: inherit;
+            padding: 10px 12px;
+            border-radius: 8px;
+            border: 1px solid #555;
+            background: #2c2c2e;
+            color: inherit;
+        }
+
+        button {
+            background: #4a6fa5;
+            border-color: #4a6fa5;
+            cursor: pointer;
+        }
+
+        #error {
+            color: #ff8a8a;
+            min-height: 1.2em;
+            font-size: 0.9rem;
+        }
+    </style>
+</head>
+
+<body>
+    <form id="login">
+        <h1>TauriTavern</h1>
+        <input id="password" type="password" name="password" placeholder="Password" autocomplete="current-password"
+            autofocus required>
+        <button type="submit">Sign in</button>
+        <div id="error" role="alert"></div>
+    </form>
+    <script>
+        const form = document.getElementById('login');
+        const error = document.getElementById('error');
+
+        form.addEventListener('submit', async (event) => {
+            event.preventDefault();
+            error.textContent = '';
+
+            try {
+                const response = await fetch('/api/login', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ password: document.getElementById('password').value }),
+                });
+
+                if (response.ok) {
+                    window.location.reload();
+                    return;
+                }
+
+                error.textContent = 'Incorrect password.';
+            } catch {
+                error.textContent = 'Could not reach the server.';
+            }
+        });
+    </script>
+</body>
+
+</html>

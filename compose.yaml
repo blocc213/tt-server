@@ -1,0 +1,29 @@
+services:
+  tauritavern:
+    image: tauritavern-server:local
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    init: true
+    environment:
+      # Required. Put the real value in an untracked .env file or inject it from
+      # your deployment secret manager; never bake it into the image.
+      TAURITAVERN_PASSWORD: "${TAURITAVERN_PASSWORD:?set TAURITAVERN_PASSWORD in .env}"
+      RUST_LOG: "${RUST_LOG:-info}"
+    ports:
+      # The host bind address is independent from the container listener.
+      # Default: reachable only from the Ubuntu host/reverse proxy.
+      - "${TAURITAVERN_BIND_ADDRESS:-127.0.0.1}:${TAURITAVERN_PORT:-8000}:8000"
+    volumes:
+      # Contains default-user/, _tauritavern/, extensions/, chats, cards,
+      # settings, secrets and every other mutable runtime file.
+      - "${TAURITAVERN_DATA_DIR:-./docker-data}:/data"
+    tmpfs:
+      - /tmp:size=256m,mode=1777
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "--show-error", "http://127.0.0.1:8000/api/auth/status"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s

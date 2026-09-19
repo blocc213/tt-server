@@ -1,0 +1,40 @@
+# Logs
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+node_modules
+dist
+dist-ssr
+.cache
+*.local
+.playwright-mcp
+
+# Editor directories and files
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.json
+.idea
+.cursor/
+.DS_Store
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
+# FasTools
+FasTools.exe
+
+# Build artifacts
+release
+.flatpak-build/
+.flatpak-builder/
+packaging/flatpak/build-identity.env
+
+# Local upstream checkout (junction/symlink)
+sillytavern-*

@@ -1,0 +1,36 @@
+# Git data is copied explicitly for Rust build metadata. Keep only the small refs
+# needed by build.rs; working objects/history are not part of the image context.
+.git/objects
+.git/logs
+.git/index
+.git/hooks
+.git/info
+.git/COMMIT_EDITMSG
+.git/FETCH_HEAD
+.git/ORIG_HEAD
+
+# Local dependencies and build outputs are rebuilt in their own image stages.
+node_modules
+.pnpm-store
+src-tauri/target
+fastools/target
+target
+release
+
+# Mutable user data and secrets must never enter an image layer.
+data
+docker-data
+*.db
+*.sqlite
+*.sqlite3
+.env
+.env.*
+!.env.example
+
+# Local IDE/OS/test artifacts.
+.DS_Store
+.vscode
+.idea
+coverage
+*.log
+/tmp

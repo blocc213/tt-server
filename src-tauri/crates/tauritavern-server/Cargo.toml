@@ -1,0 +1,47 @@
+[package]
+name = "tauritavern-server"
+version = "2.2.0"
+description = "TauriTavern served over HTTP for browser clients on a shared server"
+authors = ["TauriTavern Team"]
+edition = "2024"
+publish = false
+
+[[bin]]
+name = "tauritavern-server"
+path = "src/main.rs"
+
+[dependencies]
+axum = { version = "0.8", default-features = false, features = ["http1", "json", "query", "tokio", "tower-log"] }
+tower-http = { version = "0.6", default-features = false, features = ["fs", "set-header", "decompression-gzip"] }
+tokio = { version = "1", default-features = false, features = ["fs", "io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+tokio-util = { version = "0.7", default-features = false, features = ["io"] }
+tokio-stream = { version = "0.1", default-features = false }
+async-trait = "0.1"
+base64 = "0.22"
+clap = { version = "4", default-features = false, features = ["std", "derive", "help", "usage", "error-context"] }
+futures-util = "0.3"
+http = "1"
+hex = "0.4"
+mime_guess = "2.0.5"
+pin-project-lite = "0.2"
+percent-encoding = "2"
+rand = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+subtle = "2.6"
+thiserror = { workspace = true }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["ansi", "env-filter", "fmt", "std"] }
+
+tt-domain = { path = "../tt-domain" }
+tt-contracts = { path = "../tt-contracts" }
+tt-ports = { path = "../tt-ports" }
+tt-application = { path = "../tt-application" }
+tt-adapter-http = { path = "../tt-adapter-http" }
+tt-adapter-tokenization = { path = "../tt-adapter-tokenization" }
+tt-adapter-extension = { path = "../tt-adapter-extension" }
+tt-adapter-provider-http = { path = "../tt-adapter-provider-http" }
+tt-adapter-storage-core = { path = "../tt-adapter-storage-core" }
+tt-adapter-storage-userdata = { path = "../tt-adapter-storage-userdata" }
+tt-adapter-media = { path = "../tt-adapter-media" }
