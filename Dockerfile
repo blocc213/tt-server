@@ -1,4 +1,7 @@
-# syntax=docker/dockerfile:1.7
+# No `# syntax=` directive on purpose. That line makes BuildKit fetch
+# docker.io/docker/dockerfile:<ver> before parsing, which fails on hosts that
+# get 401/403 from Docker Hub. Nothing here needs a non-builtin frontend:
+# no `COPY --link`, no `RUN --mount`, no heredocs.
 
 # Frontend build: the browser bundle is produced at image-build time. Node.js is
 # not present in the runtime image; tauritavern-server serves the built files.
@@ -35,9 +38,6 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 COPY src-tauri ./src-tauri
-COPY default ./default
-COPY src/scripts/templates ./src/scripts/templates
-COPY .git ./.git
 
 RUN cargo build \
       --locked \
@@ -50,9 +50,6 @@ RUN cargo build \
 # dynamically link the platform C++ runtime and libc. Node.js and the Rust build
 # toolchain are not needed at runtime.
 FROM debian:bookworm-slim AS runtime
-
-ARG TARGETARCH
-
 LABEL org.opencontainers.image.title="TauriTavern Server" \
       org.opencontainers.image.description="TauriTavern browser server" \
       org.opencontainers.image.source="https://github.com/Darkatse/TauriTavern"

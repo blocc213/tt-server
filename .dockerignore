@@ -1,13 +1,7 @@
-# Git data is copied explicitly for Rust build metadata. Keep only the small refs
-# needed by build.rs; working objects/history are not part of the image context.
-.git/objects
-.git/logs
-.git/index
-.git/hooks
-.git/info
-.git/COMMIT_EDITMSG
-.git/FETCH_HEAD
-.git/ORIG_HEAD
+# Git metadata is not part of any build stage. The server binary embeds no
+# revision string; only the Tauri desktop crate reads Git, and it is not in the
+# `tauritavern-server` dependency graph.
+.git
 
 # Local dependencies and build outputs are rebuilt in their own image stages.
 node_modules
