@@ -259,6 +259,11 @@
   - `/backgrounds/*`、`/assets/*`
   - `/user/images/*`、`/user/files/*`
 
+World Info 读取在 Tauri 与浏览器服务端必须使用相同的 invoke 契约：
+`get_world_infos_batch({ dto: { names: string[] } }) -> { items: [{ name, data }] }`。
+`/api/worldinfo/get` 的 broker 与 `/api/worldinfo/get-batch` 均消费该结构；不能将参数改成顶层 `names`，也不能返回裸数组。
+角色卡内嵌世界书导入后的验收应包含浏览器编辑器条目与正文、刷新后的读取；仅验证磁盘文件或直接调用 service 不足以证明浏览器可用。
+
 ### 4.4 浏览器资源契约（Public）
 
 这些路径必须能被浏览器**原生子资源加载**（`<img src>` / `<link href>` / `<script src>` / `CSS url()`），且 dev/prod 语义一致：

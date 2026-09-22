@@ -785,11 +785,18 @@ async fn run(state: &Arc<AppState>, command: &str, args: Value) -> Handled {
             .await?),
 
         // ---- world info / presets / themes -----------------------------------------
-        "get_world_infos_batch" => ok(state
-            .services
-            .world_info_service
-            .get_world_infos_batch(arg(&args, "names")?)
-            .await?),
+        "get_world_infos_batch" => {
+            use tt_application::dto::world_info_dto::{
+                GetWorldInfosBatchDto, GetWorldInfosBatchResponseDto,
+            };
+            let dto: GetWorldInfosBatchDto = arg(&args, "dto")?;
+            let items = state
+                .services
+                .world_info_service
+                .get_world_infos_batch(dto.names)
+                .await?;
+            ok(GetWorldInfosBatchResponseDto { items })
+        }
         "get_avatars" => ok(state.services.avatar_service.get_avatars().await?),
         "get_all_groups" => ok(state
             .services
@@ -906,6 +913,45 @@ async fn run(state: &Arc<AppState>, command: &str, args: Value) -> Handled {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn world_info_batch_reads_saved_entries_with_browser_dto_contract() {
+        let root = std::env::temp_dir().join(format!("tt-world-rpc-{}", rand::random::<u64>()));
+        let services = crate::composition::build(
+            &root,
+            root.join("resources"),
+            Default::default(),
+            crate::product::USER_AGENT,
+        )
+        .await
+        .expect("build isolated server services");
+        let state = Arc::new(AppState {
+            services,
+            auth: crate::auth::Auth::new(None),
+            frontend_dir: root.join("frontend"),
+            csrf_token: "test".into(),
+            upload_staging: Arc::new(crate::upload::UploadStaging::new(&root)),
+        });
+        let name = "角色世界书";
+        let data = json!({"entries": {"7": {
+            "uid": 7, "key": ["城门"], "content": "城门在日落时关闭", "disable": false
+        }}});
+        dispatch(&state, "save_world_info", json!({"dto": {"name": name, "data": data}}))
+            .await
+            .expect("save command exposed")
+            .expect("save world");
+        let response = dispatch(
+            &state,
+            "get_world_infos_batch",
+            json!({"dto": {"names": [name]}}),
+        )
+        .await
+        .expect("batch command exposed")
+        .expect("read with browser request envelope");
+        assert_eq!(response, json!({"items": [{"name": name, "data": data}]}));
+        drop(state);
+        tokio::fs::remove_dir_all(root).await.expect("remove test data");
+    }
 
     /// Arm names in `run`'s `match`, parsed from this file's own source.
     ///
