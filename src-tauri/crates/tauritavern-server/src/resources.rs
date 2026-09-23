@@ -10,7 +10,6 @@ use std::path::{Path, PathBuf};
 
 use tt_domain::errors::DomainError;
 use tt_ports::bundled_resource::BundledResourceStore;
-use tt_ports::bundled_template::BundledTemplateStore;
 
 pub struct DirectoryResourceStore {
     root: PathBuf,
@@ -89,12 +88,6 @@ impl BundledResourceStore for DirectoryResourceStore {
         collect_files(&base, &normalized_prefix, &mut entries);
         entries.sort();
         entries
-    }
-}
-
-impl BundledTemplateStore for DirectoryResourceStore {
-    fn read_text(&self, relative_path: &str) -> Result<String, DomainError> {
-        BundledResourceStore::read_text(self, relative_path)
     }
 }
 

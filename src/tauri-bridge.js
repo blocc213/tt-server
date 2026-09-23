@@ -231,36 +231,12 @@ export async function initializeBridge() {
     }
 }
 
-export async function getCsrfToken() {
-    return 'tauri-dummy-token';
-}
-
-export async function initializeApp() {
-    return initializeBridge();
-}
-
-export async function getVersion() {
-    const invokeFn = detectServerEnv() ? invoke : getInvokeFn();
-    if (!invokeFn) {
-        const response = await fetch('/version');
-        return response.json();
-    }
-
-    return invokeFn('get_version');
-}
-
 export async function getClientVersion() {
-    const invokeFn = detectServerEnv() ? invoke : getInvokeFn();
-    if (!invokeFn) {
-        const response = await fetch('/version');
-        return response.json();
-    }
-
     try {
-        return await invokeFn('get_client_version');
+        return await invoke('get_client_version');
     } catch (error) {
         console.error('Error getting client version from Tauri backend:', error);
-        const version = await invokeFn('get_version');
+        const version = await invoke('get_version');
         return {
             agent: `SillyTavern:${SILLYTAVERN_COMPAT_VERSION}:TauriTavern`,
             pkgVersion: SILLYTAVERN_COMPAT_VERSION,
@@ -290,15 +266,11 @@ export async function getChatBackupStorageStats() {
 }
 
 export async function updateTauriTavernSettings(dto) {
-    const invokeFn = getInvokeFn();
-    if (!invokeFn) {
-        throw new Error('Tauri invoke is unavailable');
-    }
     if (!isPlainObject(dto)) {
         throw new Error('Invalid TauriTavern settings DTO');
     }
 
-    return invokeFn('update_tauritavern_settings', { dto });
+    return invoke('update_tauritavern_settings', { dto });
 }
 
 export async function getRuntimePaths() {
@@ -370,16 +342,4 @@ export async function openExternalUrl(url, openWith) {
     }
 
     throw new Error('Unable to open external URL');
-}
-
-export function getAssetUrl(path) {
-    if (!isTauriEnv || !convertFileSrc || !path) {
-        return path;
-    }
-
-    try {
-        return convertFileSrc(path, 'asset');
-    } catch {
-        return path;
-    }
 }

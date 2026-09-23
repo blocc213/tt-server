@@ -18,6 +18,11 @@ use std::sync::Arc;
 
 use serde_json::{Value, json};
 
+use tt_application::dto::agent_dto;
+use tt_application::dto::llm_connection_dto::{LlmConnectionIdDto, SaveLlmConnectionDto};
+use tt_application::services::agent_workspace_lifecycle_service::AgentChatWorkspaceTarget;
+use tt_ports::repositories::agent_workspace_lifecycle_repository::AgentPersistentStatePruneRequest;
+
 use crate::error::ServerError;
 use crate::state::AppState;
 
@@ -158,7 +163,86 @@ const EXPOSED_COMMANDS: &[&str] = &[
     "delete_secret",
     "rotate_secret",
     "rename_secret",
+    "update_tauritavern_settings",
+    "save_quick_reply_set",
+    "delete_quick_reply_set",
+    "list_llm_connections",
+    "load_llm_connection",
+    "save_llm_connection",
+    "delete_llm_connection",
+    "start_agent_run",
+    "prepare_agent_prompt_assembly",
+    "build_agent_current_model_connection_snapshot",
+    "apply_agent_current_model_connection_snapshot",
+    "list_agent_profiles",
+    "list_agent_tools",
+    "resolve_agent_system_prompt",
+    "load_agent_profile",
+    "diagnose_agent_profile",
+    "save_agent_profile",
+    "delete_agent_profile",
+    "repair_agent_profile_file",
+    "retarget_agent_profile_preset_refs",
+    "cancel_agent_run",
+    "submit_agent_run_guidance",
+    "list_agent_runs",
+    "plan_agent_run_prune",
+    "apply_agent_run_prune",
+    "read_agent_run_events",
+    "read_agent_workspace_file",
+    "read_agent_model_turn",
+    "read_agent_prompt_assembly_request",
+    "resolve_agent_chat_commit",
+    "resolve_agent_prompt_assembly",
+    "resolve_agent_persistent_state_metadata_update",
+    "prune_agent_chat_persistent_states",
+    "download_skill_import_url",
+    "list_skills",
+    "list_skill_files",
+    "preview_skill_import",
+    "install_skill_import",
+    "read_skill_file",
+    "write_skill_file",
+    "export_skill",
+    "delete_skill",
+    "move_skill",
+    "retarget_skill_scope",
 ];
+
+/// Rejects any filesystem path the browser did not get from upload staging.
+///
+/// Import/avatar/background commands take a server path because the Tauri host
+/// hands them native file-picker paths. Over HTTP the only legitimate source is
+/// `stage_upload_finish`; anything else would let a client import, copy or
+/// delete an arbitrary server file (`/etc/passwd`, `default-user/secrets.json`).
+fn staged(state: &AppState, path: &str) -> Result<(), ServerError> {
+    state.upload_staging.validate_path(path).map(|_| ())
+}
+
+fn staged_field(state: &AppState, dto: &Value, key: &str) -> Result<(), ServerError> {
+    match dto.get(key) {
+        None | Some(Value::Null) => Ok(()),
+        Some(Value::String(path)) => staged(state, path),
+        Some(_) => Err(ServerError::BadRequest(format!("Invalid `{key}`"))),
+    }
+}
+
+/// Skill imports from the browser must carry their bytes (`inlineFiles`,
+/// `archiveBase64`) or a staged archive; `directory` would copy any server
+/// directory into a readable skill.
+fn staged_skill_input(
+    state: &AppState,
+    input: &tt_domain::models::skill::SkillImportInput,
+) -> Result<(), ServerError> {
+    use tt_domain::models::skill::SkillImportInput;
+    match input {
+        SkillImportInput::InlineFiles { .. } | SkillImportInput::ArchiveBase64 { .. } => Ok(()),
+        SkillImportInput::ArchiveFile { path, .. } => staged(state, path),
+        SkillImportInput::Directory { .. } => Err(ServerError::BadRequest(
+            "Directory Skill imports are not available in server mode".into(),
+        )),
+    }
+}
 
 /// Dispatches one command. `None` means "not exposed by the server host".
 pub async fn dispatch(state: &Arc<AppState>, command: &str, args: Value) -> Option<Handled> {
@@ -229,11 +313,15 @@ async fn run(state: &Arc<AppState>, command: &str, args: Value) -> Handled {
             .character_service
             .update_character(&arg::<String>(&args, "name")?, arg(&args, "dto")?)
             .await?),
-        "update_character_card_data" => ok(state
-            .services
-            .character_service
-            .update_character_card_data(&arg::<String>(&args, "name")?, arg(&args, "dto")?)
-            .await?),
+        "update_character_card_data" => {
+            let dto: Value = arg(&args, "dto")?;
+            staged_field(state, &dto, "avatar_path")?;
+            ok(state
+                .services
+                .character_service
+                .update_character_card_data(&arg::<String>(&args, "name")?, serde_json::from_value(dto)?)
+                .await?)
+        }
         "merge_character_card_data" => ok(state
             .services
             .character_service
@@ -288,26 +376,42 @@ async fn run(state: &Arc<AppState>, command: &str, args: Value) -> Handled {
             .character_service
             .create_character(arg(&args, "dto")?)
             .await?),
-        "create_character_with_avatar" => ok(state
-            .services
-            .character_service
-            .create_with_avatar(arg(&args, "dto")?)
-            .await?),
-        "import_character" => ok(state
-            .services
-            .character_service
-            .import_character(arg(&args, "dto")?)
-            .await?),
-        "replace_character" => ok(state
-            .services
-            .character_service
-            .replace_character(arg(&args, "dto")?)
-            .await?),
-        "update_avatar" => ok(state
-            .services
-            .character_service
-            .update_avatar(arg(&args, "dto")?)
-            .await?),
+        "create_character_with_avatar" => {
+            let dto: Value = arg(&args, "dto")?;
+            staged_field(state, &dto, "avatar_path")?;
+            ok(state
+                .services
+                .character_service
+                .create_with_avatar(serde_json::from_value(dto)?)
+                .await?)
+        }
+        "import_character" => {
+            let dto: Value = arg(&args, "dto")?;
+            staged_field(state, &dto, "file_path")?;
+            ok(state
+                .services
+                .character_service
+                .import_character(serde_json::from_value(dto)?)
+                .await?)
+        }
+        "replace_character" => {
+            let dto: Value = arg(&args, "dto")?;
+            staged_field(state, &dto, "file_path")?;
+            ok(state
+                .services
+                .character_service
+                .replace_character(serde_json::from_value(dto)?)
+                .await?)
+        }
+        "update_avatar" => {
+            let dto: Value = arg(&args, "dto")?;
+            staged_field(state, &dto, "avatar_path")?;
+            ok(state
+                .services
+                .character_service
+                .update_avatar(serde_json::from_value(dto)?)
+                .await?)
+        }
         "export_character_content" => ok(state
             .services
             .character_service
@@ -378,14 +482,15 @@ async fn run(state: &Arc<AppState>, command: &str, args: Value) -> Handled {
                 .rename_background(&dto.old_bg, &dto.new_bg)
                 .await?)
         }
-        "upload_background_from_path" => ok(state
-            .services
-            .background_service
-            .upload_background_from_path(
-                &arg::<String>(&args, "filename")?,
-                &arg::<String>(&args, "filePath")?,
-            )
-            .await?),
+        "upload_background_from_path" => {
+            let file_path = arg::<String>(&args, "filePath")?;
+            staged(state, &file_path)?;
+            ok(state
+                .services
+                .background_service
+                .upload_background_from_path(&arg::<String>(&args, "filename")?, &file_path)
+                .await?)
+        }
         "get_background_folders" => ok(state
             .services
             .image_metadata_service
@@ -904,6 +1009,391 @@ async fn run(state: &Arc<AppState>, command: &str, args: Value) -> Handled {
                 .await?)
         }
 
+        "update_tauritavern_settings" => {
+            let dto: tt_application::dto::settings_dto::UpdateTauriTavernSettingsDto =
+                arg(&args, "dto")?;
+            // Upstream keeps both in config.yaml, not the UI: a browser session
+            // must not be able to unlock secret readback or reroute every
+            // outbound request through a proxy of its choosing.
+            if dto.allow_keys_exposure.is_some() || dto.request_proxy.is_some() {
+                return Err(ServerError::Unauthorized(
+                    "Key exposure and request proxy are server configuration in server mode"
+                        .into(),
+                ));
+            }
+            let retention_changed = dto
+                .agent
+                .as_ref()
+                .is_some_and(|agent| agent.retention.is_some());
+            let settings = state
+                .services
+                .settings_service
+                .update_tauritavern_settings(dto)
+                .await?;
+            state
+                .services
+                .host_resource_service
+                .set_avatar_persona_original_images_enabled(
+                    settings.avatar_persona_original_images_enabled,
+                );
+            if retention_changed {
+                state
+                    .services
+                    .agent_run_retention_automation_service
+                    .notify_settings_changed();
+            }
+            ok(settings)
+        }
+        "save_quick_reply_set" => ok(state
+            .services
+            .quick_reply_service
+            .save_quick_reply_set(arg(&args, "payload")?)
+            .await?),
+        "delete_quick_reply_set" => ok(state
+            .services
+            .quick_reply_service
+            .delete_quick_reply_set(arg(&args, "payload")?)
+            .await?),
+
+        // ---- LLM connections ---------------------------------------------------------
+        "list_llm_connections" => ok(json!({
+            "connections": state.services.llm_connection_service.list_connections().await?,
+        })),
+        "load_llm_connection" => {
+            let dto: LlmConnectionIdDto = arg(&args, "dto")?;
+            ok(json!({
+                "connection": state
+                    .services
+                    .llm_connection_service
+                    .load_connection(&dto.connection_id)
+                    .await?,
+            }))
+        }
+        "save_llm_connection" => {
+            let dto: SaveLlmConnectionDto = arg(&args, "dto")?;
+            ok(state
+                .services
+                .llm_connection_service
+                .save_connection(dto.connection)
+                .await?)
+        }
+        "delete_llm_connection" => {
+            let dto: LlmConnectionIdDto = arg(&args, "dto")?;
+            ok(state
+                .services
+                .llm_connection_service
+                .delete_connection(&dto.connection_id)
+                .await?)
+        }
+
+        // ---- agent runtime -------------------------------------------------------------
+        // Mirrors crates/tauritavern/src/presentation/commands/agent_commands.rs.
+        // The browser drives runs by polling `read_agent_run_events`, so no
+        // event channel is needed.
+        "start_agent_run" => ok(state
+            .services
+            .agent_runtime_service
+            .start_run(arg(&args, "dto")?)
+            .await?),
+        "prepare_agent_prompt_assembly" => {
+            let dto: agent_dto::AgentPreparePromptAssemblyDto = arg(&args, "dto")?;
+            let services = &state.services;
+            let profile = services
+                .prompt_assembly_service
+                .resolve_profile(
+                    dto.profile_id.as_deref(),
+                    services.agent_runtime_service.tool_catalog(),
+                )
+                .await?;
+            let visible_tools = services
+                .agent_runtime_service
+                .visible_model_tools(&profile)?;
+            ok(services
+                .prompt_assembly_service
+                .prepare_frontend_prompt_assembly(dto, profile, &visible_tools)
+                .await?)
+        }
+        "build_agent_current_model_connection_snapshot" => {
+            let dto: agent_dto::AgentBuildCurrentModelConnectionSnapshotDto = arg(&args, "dto")?;
+            ok(agent_dto::AgentBuildCurrentModelConnectionSnapshotResultDto {
+                current_model_connection: state
+                    .services
+                    .prompt_assembly_service
+                    .build_current_model_connection_snapshot(
+                        &dto.settings,
+                        &dto.model,
+                        dto.secret_id.as_deref(),
+                    )?,
+            })
+        }
+        "apply_agent_current_model_connection_snapshot" => {
+            let dto: agent_dto::AgentApplyCurrentModelConnectionSnapshotDto = arg(&args, "dto")?;
+            ok(agent_dto::AgentApplyCurrentModelConnectionSnapshotResultDto {
+                settings: state
+                    .services
+                    .prompt_assembly_service
+                    .apply_current_model_connection_snapshot(
+                        dto.settings,
+                        &dto.current_model_connection,
+                    )?,
+            })
+        }
+        "list_agent_profiles" => {
+            let list = state.services.agent_profile_service.list_profiles().await?;
+            ok(agent_dto::AgentListProfilesResultDto {
+                profiles: list.profiles,
+                issues: list.issues,
+            })
+        }
+        "list_agent_tools" => ok(agent_dto::AgentListToolsResultDto {
+            tools: state.services.agent_runtime_service.tool_catalog_items()?,
+        }),
+        "resolve_agent_system_prompt" => {
+            let dto: agent_dto::AgentResolveSystemPromptDto = arg(&args, "dto")?;
+            ok(agent_dto::AgentResolveSystemPromptResultDto {
+                agent_system_prompt: state
+                    .services
+                    .agent_runtime_service
+                    .resolve_agent_system_prompt(dto.profile_id.as_deref())
+                    .await?,
+            })
+        }
+        "load_agent_profile" => {
+            let dto: agent_dto::AgentProfileIdDto = arg(&args, "dto")?;
+            ok(agent_dto::AgentLoadProfileResultDto {
+                profile: state
+                    .services
+                    .agent_profile_service
+                    .load_profile(&dto.profile_id)
+                    .await?,
+            })
+        }
+        "diagnose_agent_profile" => {
+            let dto: agent_dto::AgentProfileIdDto = arg(&args, "dto")?;
+            ok(state
+                .services
+                .agent_profile_diagnostic_service
+                .diagnose_profile(
+                    &dto.profile_id,
+                    state.services.agent_runtime_service.tool_catalog(),
+                )
+                .await?)
+        }
+        "save_agent_profile" => {
+            let dto: agent_dto::AgentSaveProfileDto = arg(&args, "dto")?;
+            ok(state
+                .services
+                .agent_profile_service
+                .save_profile(
+                    dto.profile,
+                    state.services.agent_runtime_service.tool_catalog(),
+                )
+                .await?)
+        }
+        "delete_agent_profile" => {
+            let dto: agent_dto::AgentProfileIdDto = arg(&args, "dto")?;
+            ok(state
+                .services
+                .agent_profile_service
+                .delete_profile(&dto.profile_id)
+                .await?)
+        }
+        "repair_agent_profile_file" => {
+            let dto: agent_dto::AgentRepairProfileFileDto = arg(&args, "dto")?;
+            ok(state
+                .services
+                .agent_profile_service
+                .repair_profile_file(&dto.profile_id, dto.action)
+                .await?)
+        }
+        "retarget_agent_profile_preset_refs" => {
+            let dto: agent_dto::AgentRetargetPresetRefsDto = arg(&args, "dto")?;
+            let result = state
+                .services
+                .agent_profile_service
+                .retarget_preset_refs(dto.from, dto.to)
+                .await?;
+            ok(agent_dto::AgentRetargetPresetRefsResultDto {
+                updated: result.profile_ids.len(),
+                profile_ids: result
+                    .profile_ids
+                    .iter()
+                    .map(|id| id.as_str().to_string())
+                    .collect(),
+            })
+        }
+        "cancel_agent_run" => ok(state
+            .services
+            .agent_runtime_service
+            .cancel_run(arg(&args, "dto")?)
+            .await?),
+        "submit_agent_run_guidance" => ok(state
+            .services
+            .agent_runtime_service
+            .submit_guidance(arg(&args, "dto")?)
+            .await?),
+        "list_agent_runs" => ok(state
+            .services
+            .agent_run_history_service
+            .list_runs(arg(&args, "dto")?)
+            .await?),
+        "plan_agent_run_prune" => ok(state
+            .services
+            .agent_run_history_service
+            .plan_run_prune(arg(&args, "dto")?)
+            .await?),
+        "apply_agent_run_prune" => ok(state
+            .services
+            .agent_run_history_service
+            .apply_run_prune(arg(&args, "dto")?)
+            .await?),
+        "read_agent_run_events" => ok(state
+            .services
+            .agent_runtime_service
+            .read_events(arg(&args, "dto")?)
+            .await?),
+        "read_agent_workspace_file" => ok(state
+            .services
+            .agent_runtime_service
+            .read_workspace_file(arg(&args, "dto")?)
+            .await?),
+        "read_agent_model_turn" => ok(state
+            .services
+            .agent_runtime_service
+            .read_model_turn(arg(&args, "dto")?)
+            .await?),
+        "read_agent_prompt_assembly_request" => ok(state
+            .services
+            .agent_runtime_service
+            .read_prompt_assembly_request(arg(&args, "dto")?)
+            .await?),
+        "resolve_agent_chat_commit" => ok(state
+            .services
+            .agent_runtime_service
+            .resolve_chat_commit(arg(&args, "dto")?)
+            .await?),
+        "resolve_agent_prompt_assembly" => ok(state
+            .services
+            .agent_runtime_service
+            .resolve_prompt_assembly(arg(&args, "dto")?)
+            .await?),
+        "resolve_agent_persistent_state_metadata_update" => ok(state
+            .services
+            .agent_runtime_service
+            .resolve_persistent_state_metadata_update(arg(&args, "dto")?)
+            .await?),
+        "prune_agent_chat_persistent_states" => {
+            prune_agent_chat_persistent_states(state, arg(&args, "dto")?).await
+        }
+
+        // ---- agent skills --------------------------------------------------------------
+        "download_skill_import_url" => ok(state
+            .services
+            .skill_service
+            .download_import_url(&arg::<String>(&args, "url")?)
+            .await?),
+        "list_skills" => ok(state
+            .services
+            .skill_service
+            .list_skills(opt_arg(&args, "scope")?.unwrap_or_default())
+            .await?),
+        "list_skill_files" => ok(state
+            .services
+            .skill_service
+            .list_skill_files(
+                opt_arg(&args, "scope")?.unwrap_or_default(),
+                &arg::<String>(&args, "name")?,
+            )
+            .await?),
+        "preview_skill_import" => {
+            let input: tt_domain::models::skill::SkillImportInput = arg(&args, "input")?;
+            staged_skill_input(state, &input)?;
+            ok(state
+                .services
+                .skill_service
+                .preview_import(input, opt_arg(&args, "targetScope")?.unwrap_or_default())
+                .await?)
+        }
+        "install_skill_import" => {
+            let request: tt_domain::models::skill::SkillInstallRequest = arg(&args, "request")?;
+            staged_skill_input(state, &request.input)?;
+            ok(state.services.skill_service.install_import(request).await?)
+        }
+        "read_skill_file" => {
+            use tt_domain::models::skill::DEFAULT_SKILL_READ_FALLBACK_MAX_CHARS as MAX;
+            let max_chars = match opt_arg::<usize>(&args, "maxChars")? {
+                Some(0) => {
+                    return Err(ServerError::BadRequest(
+                        "maxChars must be greater than 0".into(),
+                    ));
+                }
+                Some(value) if value > MAX => {
+                    return Err(ServerError::BadRequest(format!(
+                        "maxChars must be <= {MAX} for api.skill.readFile"
+                    )));
+                }
+                Some(value) => value,
+                None => MAX,
+            };
+            ok(state
+                .services
+                .skill_service
+                .read_skill_file(tt_domain::models::skill::SkillReadRequest {
+                    scope: opt_arg(&args, "scope")?.unwrap_or_default(),
+                    name: arg(&args, "name")?,
+                    path: arg(&args, "path")?,
+                    start_line: opt_arg(&args, "startLine")?,
+                    line_count: opt_arg(&args, "lineCount")?,
+                    start_char: opt_arg(&args, "startChar")?,
+                    max_chars: Some(max_chars),
+                })
+                .await?)
+        }
+        "write_skill_file" => ok(state
+            .services
+            .skill_service
+            .write_skill_file(tt_domain::models::skill::SkillWriteRequest {
+                scope: opt_arg(&args, "scope")?.unwrap_or_default(),
+                name: arg(&args, "name")?,
+                path: arg(&args, "path")?,
+                content: arg(&args, "content")?,
+                expected_sha256: opt_arg(&args, "expectedSha256")?,
+            })
+            .await?),
+        "export_skill" => {
+            let exported = state
+                .services
+                .skill_service
+                .export_skill(
+                    opt_arg(&args, "scope")?.unwrap_or_default(),
+                    &arg::<String>(&args, "name")?,
+                )
+                .await?;
+            ok(json!({
+                "fileName": exported.file_name,
+                "contentBase64": BASE64_STANDARD.encode(exported.bytes),
+                "sha256": exported.sha256,
+            }))
+        }
+        "delete_skill" => ok(state
+            .services
+            .skill_service
+            .delete_skill(
+                opt_arg(&args, "scope")?.unwrap_or_default(),
+                &arg::<String>(&args, "name")?,
+            )
+            .await?),
+        "move_skill" => ok(state
+            .services
+            .skill_service
+            .move_skill(arg(&args, "request")?)
+            .await?),
+        "retarget_skill_scope" => ok(state
+            .services
+            .skill_service
+            .retarget_scope(arg(&args, "request")?)
+            .await?),
+
         other => Err(ServerError::NotFound(format!(
             "Command `{other}` is not available in server mode"
         ))),
@@ -1031,6 +1521,72 @@ mod tests {
             assert!(is_exposed(command), "{command} must stay reachable");
         }
     }
+}
+
+/// Mirrors `agent_commands::prune_agent_chat_persistent_states`: keeps every
+/// state id still referenced by the chat, prunes the rest of the candidates.
+async fn prune_agent_chat_persistent_states(
+    state: &Arc<AppState>,
+    dto: agent_dto::AgentPruneChatPersistentStatesDto,
+) -> Handled {
+    use tt_domain::models::agent::AgentChatRef;
+
+    let AgentChatRef::Character {
+        character_id,
+        file_name,
+    } = &dto.chat_ref
+    else {
+        return Err(ServerError::BadRequest(
+            "agent.group_persistent_state_prune_unsupported".into(),
+        ));
+    };
+    let candidate_state_ids = dto.candidate_state_ids.ok_or_else(|| {
+        ServerError::BadRequest("agent.persistent_state_prune_candidates_required".into())
+    })?;
+
+    let payload = state
+        .services
+        .chat_service
+        .get_chat_payload(character_id, file_name)
+        .await?;
+    let retained_state_ids: std::collections::BTreeSet<String> = payload
+        .iter()
+        .flat_map(|item| {
+            let swipes = item
+                .get("swipe_info")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten();
+            std::iter::once(item).chain(swipes)
+        })
+        .filter_map(|entry| {
+            entry
+                .pointer("/extra/tauritavern/agent/persistStateId")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|id| !id.is_empty())
+                .map(ToString::to_string)
+        })
+        .collect();
+
+    let prune = state
+        .services
+        .chat_service
+        .prune_agent_persistent_states(
+            &AgentChatWorkspaceTarget {
+                chat_ref: dto.chat_ref,
+                stable_chat_id: dto.stable_chat_id,
+            },
+            AgentPersistentStatePruneRequest {
+                retained_state_ids: retained_state_ids.into_iter().collect(),
+                candidate_state_ids,
+            },
+        )
+        .await?;
+    ok(agent_dto::AgentPruneChatPersistentStatesResultDto {
+        workspace_id: prune.workspace_id,
+        removed_state_ids: prune.removed_state_ids,
+    })
 }
 
 async fn bootstrap_snapshot(state: &Arc<AppState>) -> Handled {

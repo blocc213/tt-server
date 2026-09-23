@@ -5,7 +5,7 @@
 //! every multipart form route. Server paths are opaque implementation details:
 //! every operation canonicalizes against one private staging root.
 
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
 use tokio::io::AsyncWriteExt;
@@ -147,9 +147,17 @@ impl UploadStaging {
         Ok(path)
     }
 
-    fn validate_path(&self, file_path: &str) -> Result<PathBuf, ServerError> {
+    /// Accepts only paths inside the staging root. `Path::starts_with` is
+    /// lexical, so `<root>/../default-user/secrets.json` passes it; requiring
+    /// every remaining component to be `Normal` is what keeps `..` out.
+    pub fn validate_path(&self, file_path: &str) -> Result<PathBuf, ServerError> {
         let path = PathBuf::from(file_path);
-        if !path.is_absolute() || !path.starts_with(&self.root) {
+        let inside = path.is_absolute()
+            && path.strip_prefix(&self.root).is_ok_and(|rest| {
+                rest.components()
+                    .all(|component| matches!(component, Component::Normal(_)))
+            });
+        if !inside {
             return Err(ServerError::BadRequest(
                 "Upload path is outside the staging directory".into(),
             ));
@@ -206,6 +214,17 @@ mod tests {
     fn rejects_paths_outside_staging() {
         let staging = UploadStaging::new(Path::new("/tmp/data"));
         assert!(staging.validate_path("/etc/passwd").is_err());
+        // Lexically under the root but resolves outside it.
+        assert!(
+            staging
+                .validate_path("/tmp/data/.server-upload-staging/../default-user/secrets.json")
+                .is_err()
+        );
+        assert!(
+            staging
+                .validate_path("/tmp/data/.server-upload-staging/character/abc.png")
+                .is_ok()
+        );
     }
 
     #[test]

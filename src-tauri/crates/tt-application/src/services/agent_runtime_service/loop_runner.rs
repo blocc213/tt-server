@@ -159,7 +159,13 @@ impl AgentRuntimeService {
                         exit_policy,
                         &prepared.tool_turn,
                     );
-                    prepared.request.messages.push(response.message.clone());
+                    // An empty turn (no text, no tool call) carries nothing the
+                    // model needs to own, and Anthropic-backed endpoints reject
+                    // an assistant message with empty content, which would turn
+                    // a recoverable slip into a hard validation failure.
+                    if !extract_response_text(&response).trim().is_empty() {
+                        prepared.request.messages.push(response.message.clone());
+                    }
                     prepared.request.messages.push(AgentModelMessage {
                         role: AgentModelRole::User,
                         parts: vec![AgentModelContentPart::Text { text: nudge_text }],

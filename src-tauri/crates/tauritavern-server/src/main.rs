@@ -77,12 +77,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         upload_staging: Arc::new(upload::UploadStaging::new(&args.data_dir)),
     });
 
+    // Same background loops the app host starts: chat history persistence and
+    // Agent run retention (prunes old runs when the user enables it).
+    let background_cancel = tokio_util::sync::CancellationToken::new();
     let chat_history = state.services.chat_history_coordinator.clone();
-    let chat_history_cancel = tokio_util::sync::CancellationToken::new();
-    let chat_history_task = tokio::spawn({
-        let cancel = chat_history_cancel.clone();
-        async move { chat_history.run(cancel).await }
-    });
+    let chat_history_task = tokio::spawn(chat_history.run(background_cancel.clone()));
+    let retention = state
+        .services
+        .agent_run_retention_automation_service
+        .clone();
+    let retention_task = tokio::spawn(retention.run(background_cancel.clone()));
 
     let addr = SocketAddr::new(args.host, args.port);
     let listener = tokio::net::TcpListener::bind(addr).await?;
@@ -97,8 +101,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_graceful_shutdown(shutdown_signal())
         .await?;
 
-    chat_history_cancel.cancel();
-    let _ = chat_history_task.await;
+    background_cancel.cancel();
+    let _ = tokio::join!(chat_history_task, retention_task);
     tracing::info!("Server stopped");
     Ok(())
 }
