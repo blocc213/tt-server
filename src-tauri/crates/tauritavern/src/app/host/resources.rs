@@ -12,9 +12,12 @@ use crate::infrastructure::bundled_resources::BundledResourceStore;
 use crate::infrastructure::paths::RuntimePaths;
 use tauri::Manager;
 use tauri_plugin_fs::FsExt;
-use tt_adapter_media::{FilesystemHostResourceStore, FilesystemUserMediaStore};
+use tt_adapter_media::{
+    FilesystemHostResourceStore, FilesystemUserFileStore, FilesystemUserMediaStore,
+};
 use tt_application::services::bundled_template_service::BundledTemplateService;
 use tt_application::services::host_resource_service::HostResourceService;
+use tt_application::services::user_file_service::UserFileService;
 use tt_application::services::user_media_service::UserMediaService;
 use tt_domain::errors::DomainError;
 
@@ -80,6 +83,15 @@ pub(super) fn install_runtime_resources(
         &runtime_paths.data_root,
     ));
     app.manage(Arc::new(UserMediaService::new(user_media_store)));
+
+    app.manage(Arc::new(UserFileService::new(Arc::new(
+        FilesystemUserFileStore::new(
+            tt_domain::models::user_directory::UserDirectory::default_user(
+                &runtime_paths.data_root,
+            )
+            .files,
+        ),
+    ))));
 
     Ok(host_resource_service)
 }

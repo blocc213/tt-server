@@ -58,6 +58,7 @@ pub mod tt_sync_service;
 pub mod tts_service;
 pub mod update_service;
 pub mod user_directory_service;
+pub mod user_file_service;
 pub mod user_media_service;
 pub mod user_service;
 pub mod world_info_service;

@@ -9,4 +9,5 @@ pub mod runtime_paths;
 pub mod settings;
 pub mod sync;
 pub mod sync_automation;
+pub mod user_file;
 pub mod user_media;

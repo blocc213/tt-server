@@ -14,7 +14,7 @@ use tt_adapter_extension::FileExtensionRepository;
 use tt_adapter_http::{HttpClientPool, HttpExternalImportDownloader};
 use tt_adapter_media::{
     FileAvatarRepository, FileBackgroundRepository, FileImageMetadataRepository,
-    FilesystemHostResourceStore,
+    FilesystemHostResourceStore, FilesystemUserFileStore,
 };
 use tt_adapter_provider_http::HttpChatCompletionRepository;
 use tt_adapter_storage_core::{
@@ -61,6 +61,7 @@ use tt_application::services::settings_service::{RequestProxyRuntime, SettingsSe
 use tt_application::services::skill_service::SkillService;
 use tt_application::services::theme_service::ThemeService;
 use tt_application::services::tokenization_service::TokenizationService;
+use tt_application::services::user_file_service::UserFileService;
 use tt_application::services::world_info_service::WorldInfoService;
 use tt_domain::errors::DomainError;
 use tt_domain::ios_policy::{
@@ -103,6 +104,7 @@ pub struct ServerServices {
     pub world_info_service: Arc<WorldInfoService>,
     pub native_regex_service: Arc<NativeRegexService>,
     pub host_resource_service: Arc<HostResourceService>,
+    pub user_file_service: Arc<UserFileService>,
     pub ios_policy: IosPolicyActivationReport,
 }
 
@@ -332,6 +334,9 @@ pub async fn build(
         settings.avatar_persona_original_images_enabled,
         Arc::new(FilesystemHostResourceStore::from_data_root(&data_root)),
     ));
+    let user_file_service = Arc::new(UserFileService::new(Arc::new(
+        FilesystemUserFileStore::new(default_user_dir.join("user/files")),
+    )));
 
     Ok(ServerServices {
         character_service,
@@ -368,6 +373,7 @@ pub async fn build(
         world_info_service: Arc::new(WorldInfoService::new(world_info_repository)),
         native_regex_service: Arc::new(NativeRegexService::new()),
         host_resource_service,
+        user_file_service,
         ios_policy,
     })
 }

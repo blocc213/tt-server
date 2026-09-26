@@ -75,6 +75,8 @@ const EXPOSED_COMMANDS: &[&str] = &[
     "get_character_chats",
     "update_character",
     "update_character_card_data",
+    "check_character_lorebook_conflict",
+    "resolve_character_lorebook_conflict",
     "merge_character_card_data",
     "bulk_merge_character_card_data",
     "delete_character",
@@ -146,6 +148,10 @@ const EXPOSED_COMMANDS: &[&str] = &[
     "search_chats",
     "rename_chat",
     "delete_chat",
+    "upload_user_file",
+    "delete_user_file",
+    "verify_user_files",
+    "sanitize_filename",
     "get_world_infos_batch",
     "get_avatars",
     "get_all_groups",
@@ -319,9 +325,22 @@ async fn run(state: &Arc<AppState>, command: &str, args: Value) -> Handled {
             ok(state
                 .services
                 .character_service
-                .update_character_card_data(&arg::<String>(&args, "name")?, serde_json::from_value(dto)?)
+                .update_character_card_data(
+                    &arg::<String>(&args, "name")?,
+                    serde_json::from_value(dto)?,
+                )
                 .await?)
         }
+        "check_character_lorebook_conflict" => ok(state
+            .services
+            .character_service
+            .check_lorebook_conflict(arg(&args, "dto")?)
+            .await?),
+        "resolve_character_lorebook_conflict" => ok(state
+            .services
+            .character_service
+            .resolve_lorebook_conflict(arg(&args, "dto")?)
+            .await?),
         "merge_character_card_data" => ok(state
             .services
             .character_service
@@ -347,6 +366,33 @@ async fn run(state: &Arc<AppState>, command: &str, args: Value) -> Handled {
             .character_service
             .duplicate_character(arg(&args, "dto")?)
             .await?),
+
+        // ---- user files -------------------------------------------------------------
+        "upload_user_file" => ok(state
+            .services
+            .user_file_service
+            .upload_user_file(
+                &arg::<String>(&args, "name")?,
+                &arg::<String>(&args, "dataBase64")?,
+            )
+            .await?),
+        "delete_user_file" => ok(state
+            .services
+            .user_file_service
+            .delete_user_file(&arg::<String>(&args, "path")?)
+            .await?),
+        "verify_user_files" => ok(state
+            .services
+            .user_file_service
+            .verify_user_files(arg(&args, "urls")?)
+            .await?),
+        "sanitize_filename" => {
+            let file_name: String = arg(&args, "fileName")?;
+            if file_name.is_empty() {
+                return Err(ServerError::BadRequest("No fileName specified".into()));
+            }
+            ok(tt_domain::models::filename::sanitize_filename(&file_name))
+        }
 
         // ---- upload staging ---------------------------------------------------------
         "stage_upload_begin" => {
@@ -1017,8 +1063,7 @@ async fn run(state: &Arc<AppState>, command: &str, args: Value) -> Handled {
             // outbound request through a proxy of its choosing.
             if dto.allow_keys_exposure.is_some() || dto.request_proxy.is_some() {
                 return Err(ServerError::Unauthorized(
-                    "Key exposure and request proxy are server configuration in server mode"
-                        .into(),
+                    "Key exposure and request proxy are server configuration in server mode".into(),
                 ));
             }
             let retention_changed = dto
@@ -1115,28 +1160,32 @@ async fn run(state: &Arc<AppState>, command: &str, args: Value) -> Handled {
         }
         "build_agent_current_model_connection_snapshot" => {
             let dto: agent_dto::AgentBuildCurrentModelConnectionSnapshotDto = arg(&args, "dto")?;
-            ok(agent_dto::AgentBuildCurrentModelConnectionSnapshotResultDto {
-                current_model_connection: state
-                    .services
-                    .prompt_assembly_service
-                    .build_current_model_connection_snapshot(
-                        &dto.settings,
-                        &dto.model,
-                        dto.secret_id.as_deref(),
-                    )?,
-            })
+            ok(
+                agent_dto::AgentBuildCurrentModelConnectionSnapshotResultDto {
+                    current_model_connection: state
+                        .services
+                        .prompt_assembly_service
+                        .build_current_model_connection_snapshot(
+                            &dto.settings,
+                            &dto.model,
+                            dto.secret_id.as_deref(),
+                        )?,
+                },
+            )
         }
         "apply_agent_current_model_connection_snapshot" => {
             let dto: agent_dto::AgentApplyCurrentModelConnectionSnapshotDto = arg(&args, "dto")?;
-            ok(agent_dto::AgentApplyCurrentModelConnectionSnapshotResultDto {
-                settings: state
-                    .services
-                    .prompt_assembly_service
-                    .apply_current_model_connection_snapshot(
-                        dto.settings,
-                        &dto.current_model_connection,
-                    )?,
-            })
+            ok(
+                agent_dto::AgentApplyCurrentModelConnectionSnapshotResultDto {
+                    settings: state
+                        .services
+                        .prompt_assembly_service
+                        .apply_current_model_connection_snapshot(
+                            dto.settings,
+                            &dto.current_model_connection,
+                        )?,
+                },
+            )
         }
         "list_agent_profiles" => {
             let list = state.services.agent_profile_service.list_profiles().await?;
@@ -1426,10 +1475,14 @@ mod tests {
         let data = json!({"entries": {"7": {
             "uid": 7, "key": ["城门"], "content": "城门在日落时关闭", "disable": false
         }}});
-        dispatch(&state, "save_world_info", json!({"dto": {"name": name, "data": data}}))
-            .await
-            .expect("save command exposed")
-            .expect("save world");
+        dispatch(
+            &state,
+            "save_world_info",
+            json!({"dto": {"name": name, "data": data}}),
+        )
+        .await
+        .expect("save command exposed")
+        .expect("save world");
         let response = dispatch(
             &state,
             "get_world_infos_batch",
@@ -1440,7 +1493,290 @@ mod tests {
         .expect("read with browser request envelope");
         assert_eq!(response, json!({"items": [{"name": name, "data": data}]}));
         drop(state);
-        tokio::fs::remove_dir_all(root).await.expect("remove test data");
+        tokio::fs::remove_dir_all(root)
+            .await
+            .expect("remove test data");
+    }
+
+    #[tokio::test]
+    async fn user_file_commands_preserve_browser_contract_and_confine_writes() {
+        let root =
+            std::env::temp_dir().join(format!("tt-user-files-rpc-{}", rand::random::<u64>()));
+        let services = crate::composition::build(
+            &root,
+            root.join("resources"),
+            Default::default(),
+            crate::product::USER_AGENT,
+        )
+        .await
+        .expect("build isolated server services");
+        let state = Arc::new(AppState {
+            services,
+            auth: crate::auth::Auth::new(None),
+            frontend_dir: root.join("frontend"),
+            csrf_token: "test".into(),
+            upload_staging: Arc::new(crate::upload::UploadStaging::new(&root)),
+        });
+        let files_dir = root.join("default-user/user/files");
+        let name = "LittleWhiteBox_Assistant.json";
+        let path = format!("/user/files/{name}");
+        let target = files_dir.join(name);
+        let upload = |data: &str| json!({"name": name, "dataBase64": BASE64_STANDARD.encode(data.as_bytes())});
+        for content in [r#"{"模型":"测试"}"#, r#"{"模型":"覆盖"}"#] {
+            assert_eq!(
+                dispatch(&state, "upload_user_file", upload(content))
+                    .await
+                    .expect("command exposed")
+                    .expect("upload"),
+                json!({"path": path})
+            );
+            assert_eq!(
+                tokio::fs::read(&target).await.expect("read uploaded bytes"),
+                content.as_bytes()
+            );
+        }
+        assert_eq!(
+            dispatch(
+                &state,
+                "verify_user_files",
+                json!({"urls": [path, "/user/files/missing.json"]})
+            )
+            .await
+            .expect("command exposed")
+            .expect("verify"),
+            json!({"/user/files/LittleWhiteBox_Assistant.json": true, "/user/files/missing.json": false})
+        );
+        assert_eq!(
+            dispatch(&state, "sanitize_filename", json!({"fileName": "a/b"}))
+                .await
+                .expect("command exposed")
+                .expect("sanitize"),
+            json!(tt_domain::models::filename::sanitize_filename("a/b"))
+        );
+        assert!(matches!(
+            dispatch(&state, "sanitize_filename", json!({"fileName": ""})).await,
+            Some(Err(ServerError::BadRequest(_)))
+        ));
+
+        let outside = root.join("default-user/user/secrets.json");
+        tokio::fs::write(&outside, b"untouched")
+            .await
+            .expect("write outside sentinel");
+        for invalid in [
+            "../x.json",
+            "a/b.json",
+            ".hidden",
+            "x.sh",
+            "/etc/passwd",
+            "%2e%2e.json",
+        ] {
+            assert!(
+                matches!(
+                    dispatch(
+                        &state,
+                        "upload_user_file",
+                        json!({"name": invalid, "dataBase64": BASE64_STANDARD.encode(b"unsafe")})
+                    )
+                    .await,
+                    Some(Err(ServerError::BadRequest(_)))
+                ),
+                "upload accepted {invalid}"
+            );
+        }
+        for invalid in [
+            "/user/files/../secrets.json",
+            "/etc/passwd",
+            "/user/files/%2e%2e/secrets.json",
+        ] {
+            assert!(
+                matches!(
+                    dispatch(&state, "delete_user_file", json!({"path": invalid})).await,
+                    Some(Err(ServerError::BadRequest(_)))
+                ),
+                "delete accepted {invalid}"
+            );
+        }
+        assert_eq!(
+            tokio::fs::read(&outside).await.expect("read sentinel"),
+            b"untouched"
+        );
+        assert!(!root.join("default-user/user/x.json").exists());
+        assert_eq!(
+            dispatch(&state, "delete_user_file", json!({"path": path}))
+                .await
+                .expect("command exposed")
+                .expect("delete"),
+            Value::Null
+        );
+        assert!(!target.exists());
+        assert!(matches!(
+            dispatch(&state, "delete_user_file", json!({"path": path})).await,
+            Some(Err(ServerError::NotFound(_)))
+        ));
+        drop(state);
+        tokio::fs::remove_dir_all(root)
+            .await
+            .expect("remove test data");
+    }
+
+    #[tokio::test]
+    async fn character_lorebook_conflict_commands_check_and_resolve_over_dispatch() {
+        use tt_adapter_storage_userdata::png_card_metadata::write_character_data_to_png;
+
+        let root = std::env::temp_dir().join(format!("tt-lorebook-rpc-{}", rand::random::<u64>()));
+        let services = crate::composition::build(
+            &root,
+            root.join("resources"),
+            Default::default(),
+            crate::product::USER_AGENT,
+        )
+        .await
+        .expect("build isolated server services");
+        let state = Arc::new(AppState {
+            services,
+            auth: crate::auth::Auth::new(None),
+            frontend_dir: root.join("frontend"),
+            csrf_token: "test".into(),
+            upload_staging: Arc::new(crate::upload::UploadStaging::new(&root)),
+        });
+        let world = |content: &str| {
+            json!({"entries": {"1": {
+                "uid": 1, "key": ["alpha"], "comment": "", "content": content,
+                "order": 0, "position": 0, "disable": false
+            }}})
+        };
+        let write_card = |name: &str, extensions: Value, book: Option<Value>| {
+            let mut data = json!({
+                "name": name, "description": "", "personality": "", "scenario": "",
+                "first_mes": "hi", "mes_example": "", "creator": "", "creator_notes": "",
+                "character_version": "", "alternate_greetings": [], "tags": [],
+                "extensions": extensions,
+            });
+            if let Some(book) = book {
+                data["character_book"] = book;
+            }
+            let card = json!({
+                "spec": "chara_card_v2", "spec_version": "2.0", "name": name,
+                "description": "", "personality": "", "scenario": "",
+                "first_mes": "hi", "mes_example": "", "data": data,
+            });
+            // Minimal valid 1x1 RGBA PNG; the card writer only rewrites text chunks.
+            const PNG: &[u8] = &[
+                137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 1, 0, 0, 0,
+                1, 8, 6, 0, 0, 0, 31, 21, 196, 137, 0, 0, 0, 11, 73, 68, 65, 84, 120, 156, 99, 96,
+                0, 2, 0, 0, 5, 0, 1, 122, 94, 171, 63, 0, 0, 0, 0, 73, 69, 78, 68, 174, 66, 96,
+                130,
+            ];
+            write_character_data_to_png(PNG, &card.to_string()).expect("card png")
+        };
+        let characters = root.join("default-user/characters");
+        tokio::fs::create_dir_all(&characters)
+            .await
+            .expect("characters dir");
+        let check = |name: &str| json!({"dto": {"name": name}});
+
+        tokio::fs::write(
+            characters.join("Plain.png"),
+            write_card("Plain", json!({}), None),
+        )
+        .await
+        .expect("write plain card");
+        let plain = dispatch(&state, "check_character_lorebook_conflict", check("Plain"))
+            .await
+            .expect("check exposed")
+            .expect("check plain card");
+        assert_eq!(plain["conflict"], json!(false));
+
+        dispatch(
+            &state,
+            "save_world_info",
+            json!({"dto": {"name": "Lore", "data": world("local")}}),
+        )
+        .await
+        .expect("save exposed")
+        .expect("save local world");
+        let book = json!({"name": "Lore", "entries": [{
+            "uid": 1, "keys": ["alpha"], "content": "embedded", "extensions": {}
+        }], "extensions": {}});
+        tokio::fs::write(
+            characters.join("Alice.png"),
+            write_card("Alice", json!({"world": "Lore"}), Some(book)),
+        )
+        .await
+        .expect("write conflicting card");
+
+        let conflict = dispatch(&state, "check_character_lorebook_conflict", check("Alice"))
+            .await
+            .expect("check exposed")
+            .expect("check conflicting card");
+        assert_eq!(conflict["conflict"], json!(true));
+        assert_eq!(conflict["current_available"], json!(true));
+        let stale_token = conflict["conflict_token"]
+            .as_str()
+            .expect("token")
+            .to_string();
+
+        dispatch(
+            &state,
+            "save_world_info",
+            json!({"dto": {"name": "Lore", "data": world("edited meanwhile")}}),
+        )
+        .await
+        .expect("save exposed")
+        .expect("edit world meanwhile");
+        let resolve = |token: &str| {
+            json!({"dto": {
+                "name": "Alice", "resolution": "embedded", "conflict_token": token
+            }})
+        };
+        assert!(matches!(
+            dispatch(
+                &state,
+                "resolve_character_lorebook_conflict",
+                resolve(&stale_token)
+            )
+            .await,
+            Some(Err(ServerError::Conflict(_)))
+        ));
+        let lore_path = root.join("default-user/worlds/Lore.json");
+        assert!(
+            tokio::fs::read_to_string(&lore_path)
+                .await
+                .expect("read world")
+                .contains("edited meanwhile"),
+            "stale token must not overwrite the newer local world"
+        );
+
+        let fresh = dispatch(&state, "check_character_lorebook_conflict", check("Alice"))
+            .await
+            .expect("check exposed")
+            .expect("recheck");
+        let resolved = dispatch(
+            &state,
+            "resolve_character_lorebook_conflict",
+            resolve(fresh["conflict_token"].as_str().expect("fresh token")),
+        )
+        .await
+        .expect("resolve exposed")
+        .expect("resolve with embedded");
+        assert_eq!(resolved["affected_world"], json!("Lore"));
+        assert_eq!(resolved["world_written"], json!(true));
+        assert!(
+            tokio::fs::read_to_string(&lore_path)
+                .await
+                .expect("read resolved world")
+                .contains("embedded")
+        );
+        let after = dispatch(&state, "check_character_lorebook_conflict", check("Alice"))
+            .await
+            .expect("check exposed")
+            .expect("check after resolve");
+        assert_eq!(after["conflict"], json!(false));
+
+        drop(state);
+        tokio::fs::remove_dir_all(root)
+            .await
+            .expect("remove test data");
     }
 
     /// Arm names in `run`'s `match`, parsed from this file's own source.
@@ -1451,10 +1787,7 @@ mod tests {
     /// silent 404 (or dead code) that only shows up in the browser.
     fn match_arm_commands() -> Vec<String> {
         let source = include_str!("rpc.rs");
-        let body = source
-            .split_once("async fn run(")
-            .expect("run() present")
-            .1;
+        let body = source.split_once("async fn run(").expect("run() present").1;
 
         // Top-level arms sit at exactly two indent levels inside `run`. Deeper
         // lines belong to nested matches (`devlog_append_frontend_logs` maps log
