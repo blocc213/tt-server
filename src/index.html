@@ -697,6 +697,15 @@
                                             When this is off, responses will be displayed all at once when they are complete.
                                         </span>
                                     </div>
+                                    <label id="tt_background_generation_block" for="tt_background_generation" class="checkbox_label widthFreeExpand" style="display: none;">
+                                        <input id="tt_background_generation" type="checkbox" /><span data-i18n="Background generation (mobile)">
+                                            Background generation (mobile)</span>
+                                    </label>
+                                    <div id="tt_background_generation_desc" class="toggle-description justifyLeft" style="display: none;">
+                                        <span data-i18n="tt_background_generation_desc">
+                                            Keeps generating on the server when you switch apps or lock the phone, and picks the reply back up when you return. Only Stop cancels; API costs still apply.
+                                        </span>
+                                    </div>
                                 </div>
                                 <div class="range-block" data-source="openai,claude,aws_bedrock,aimlapi,openrouter,ai21,makersuite,vertexai,mistralai,custom,cohere,perplexity,groq,siliconflow,minimax,electronhub,chutes,nanogpt,deepseek,xai,pollinations,moonshot,fireworks,cometapi,azure_openai,zai,workers_ai">
                                     <div class="range-block-title" data-i18n="Temperature">

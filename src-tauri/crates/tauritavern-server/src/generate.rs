@@ -29,8 +29,19 @@ pub struct GenerateRequest {
     /// Identifies the stream so Stop can cancel it.
     #[serde(default)]
     pub stream_id: Option<String>,
+    /// User opted in: keep generating after the browser disconnects.
+    #[serde(default)]
+    pub background: bool,
     #[serde(flatten)]
     pub payload: Value,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ResumeRequest {
+    pub stream_id: String,
+    /// Index of the first buffered event the client has not seen.
+    #[serde(default)]
+    pub from: usize,
 }
 
 #[derive(Debug, Deserialize)]
@@ -84,6 +95,20 @@ pub async fn generate(
     Json(request): Json<GenerateRequest>,
 ) -> Result<Response, ServerError> {
     let payload = request.payload;
+
+    if request.background {
+        let id = request
+            .stream_id
+            .ok_or_else(|| ServerError::BadRequest("Background generation needs a stream id".into()))?;
+        validate_stream_id(&id)?;
+        let stream = wants_stream(&payload);
+        let (job, created) = crate::background::get_or_insert(&id, stream);
+        if created {
+            let dto = serde_json::from_value(payload)?;
+            spawn_background(state.services.chat_completion_service.clone(), id, job.clone(), dto);
+        }
+        return Ok(background_response(&job, 0).await);
+    }
 
     if !wants_stream(&payload) {
         // Registered even without streaming so Stop can abort a slow
@@ -207,6 +232,70 @@ pub async fn cancel_generation(
         .await;
 
     Ok(Json(json!({ "ok": true, "cancelled": cancelled })))
+}
+
+/// Re-attaches to a background generation after the browser lost its socket.
+pub async fn resume(Json(request): Json<ResumeRequest>) -> Result<Response, ServerError> {
+    validate_stream_id(&request.stream_id)?;
+    let job = crate::background::get(&request.stream_id).ok_or_else(|| {
+        ServerError::NotFound("Background generation expired or the server restarted".into())
+    })?;
+    Ok(background_response(&job, request.from).await)
+}
+
+async fn background_response(job: &crate::background::Job, from: usize) -> Response {
+    if job.stream {
+        return Sse::new(job.replay(from))
+            .keep_alive(KeepAlive::default())
+            .into_response();
+    }
+    let body = job.result().await;
+    ([(http::header::CONTENT_TYPE, "application/json")], body).into_response()
+}
+
+/// Runs one provider call detached from any HTTP connection. Cancellation
+/// comes only from the existing cancel endpoints (the Stop button).
+fn spawn_background(
+    service: Arc<ChatCompletionService>,
+    id: String,
+    job: Arc<crate::background::Job>,
+    dto: tt_application::dto::chat_completion_dto::ChatCompletionGenerateRequestDto,
+) {
+    tokio::spawn(async move {
+        if job.stream {
+            let cancel = service.register_stream(&id).await;
+            let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel::<String>();
+            let forward = {
+                let job = job.clone();
+                tokio::spawn(async move {
+                    while let Some(chunk) = receiver.recv().await {
+                        if !chunk.is_empty() {
+                            job.push(chunk);
+                        }
+                    }
+                })
+            };
+            let outcome = service.generate_stream(dto, sender, cancel).await;
+            let _ = forward.await;
+            if let Err(error) = outcome {
+                tracing::warn!(stream_id = %id, %error, "Background chat completion stream failed");
+                job.push(json!({ "error": { "message": error.to_string() } }).to_string());
+            }
+            job.push("[DONE]".into());
+            service.complete_stream(&id).await;
+        } else {
+            let cancel = service.register_generation(&id).await;
+            let body = match service.generate_with_cancel(dto, cancel).await {
+                Ok(value) => value,
+                Err(error) => json!({ "error": { "message": error.to_string() } }),
+            };
+            job.push(body.to_string());
+            service.complete_generation(&id).await;
+        }
+        job.finish();
+        tokio::time::sleep(crate::background::RETENTION).await;
+        crate::background::remove(&id);
+    });
 }
 
 /// Cancels the stream when the response body is dropped.

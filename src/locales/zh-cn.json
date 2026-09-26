@@ -26,6 +26,8 @@
     "response legth(tokens)": "回复长度（以词符数计）",
     "Streaming": "流式传输",
     "Streaming_desc": "逐词显示生成的回复",
+    "Background generation (mobile)": "后台生成（手机）",
+    "tt_background_generation_desc": "切换应用或锁屏时，服务器继续生成；回到酒馆后自动接上回复。只有“停止”会取消，仍会产生 API 费用。",
     "context size(tokens)": "上下文长度（以词符数计）",
     "unlocked": "解锁",
     "Only enable this if your model supports context sizes greater than 8192 tokens": "仅在您的模型支持大于8192个词符的上下文长度时启用此选项",

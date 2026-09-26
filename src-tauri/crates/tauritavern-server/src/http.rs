@@ -47,6 +47,10 @@ pub fn router(state: SharedState) -> Router {
             "/api/backends/chat-completions/cancel-generation",
             post(crate::generate::cancel_generation),
         )
+        .route(
+            "/api/backends/chat-completions/resume",
+            post(crate::generate::resume),
+        )
         .route("/rpc/{command}", post(rpc))
         .route("/rpc-raw/stage_upload_chunk", post(stage_upload_chunk))
         .route("/api/logout", post(logout))

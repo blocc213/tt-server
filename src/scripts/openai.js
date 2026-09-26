@@ -34,6 +34,7 @@ import { extension_prompt_roles, extension_prompt_types } from './extension-prom
 import { allowlistSettingAllows, getActiveIosPolicyCapabilities } from './tauritavern/ios-policy.js';
 import { materializeInitialChatHistoryMessages } from './tauritavern/agent/agent-context-policy.js';
 import { projectToolTurns } from './tauritavern/tool-turn-projection.js';
+import { isBackgroundGenerationAvailable, isBackgroundGenerationEnabled, sendBackgroundGenerateRequest, setBackgroundGenerationEnabled } from './tauritavern/background-generation.js';
 
 import {
     chatCompletionDefaultPrompts,
@@ -4630,12 +4631,14 @@ async function sendOpenAIRequest(type, messages, signal, { jsonSchema = null, al
     await eventSource.emit(event_types.CHAT_COMPLETION_SETTINGS_READY, generate_data);
 
     const generate_url = '/api/backends/chat-completions/generate';
-    const response = await fetch(generate_url, {
-        method: 'POST',
-        body: JSON.stringify(generate_data),
-        headers: getRequestHeaders(),
-        signal: signal,
-    });
+    const response = isBackgroundGenerationEnabled()
+        ? await sendBackgroundGenerateRequest(generate_data, stream, signal, getRequestHeaders)
+        : await fetch(generate_url, {
+            method: 'POST',
+            body: JSON.stringify(generate_data),
+            headers: getRequestHeaders(),
+            signal: signal,
+        });
 
     if (!response.ok) {
         tryParseStreamingError(response, await response.text());
@@ -8724,6 +8727,17 @@ export function initOpenAI() {
         oai_settings.stream_openai = !!$('#stream_toggle').prop('checked');
         saveSettingsDebounced();
     });
+
+    if (isBackgroundGenerationAvailable()) {
+        $('#tt_background_generation_block, #tt_background_generation_desc').show();
+        $('#tt_background_generation').on('change', function () {
+            setBackgroundGenerationEnabled($(this).prop('checked'));
+        });
+        // accountStorage is populated during settings load, after this init runs.
+        eventSource.on(event_types.SETTINGS_LOADED_BEFORE, () => {
+            $('#tt_background_generation').prop('checked', isBackgroundGenerationEnabled());
+        });
+    }
 
     $('#use_sysprompt').on('change', function () {
         oai_settings.use_sysprompt = !!$('#use_sysprompt').prop('checked');
