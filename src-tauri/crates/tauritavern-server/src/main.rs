@@ -3,8 +3,9 @@
 //! Reuses the same Rust core as the desktop/mobile app; only the host shell
 //! differs. Native-only capabilities are not exposed here.
 
-mod background;
+mod archive;
 mod auth;
+mod background;
 mod chat;
 mod composition;
 mod config;

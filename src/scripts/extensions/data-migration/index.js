@@ -2,6 +2,8 @@ import { renderExtensionTemplateAsync } from '../../extensions.js';
 import { t, translate } from '../../i18n.js';
 import { Popup } from '../../popup.js';
 import { isAndroidRuntime, isIosRuntime } from '../../util/mobile-runtime.js';
+import { isServerEnv } from '../../../tauri-bridge.js';
+import { downloadBlobWithRuntime } from '../../file-export.js';
 import { getActiveIosPolicyActivationReport } from '../../tauritavern/ios-policy.js';
 
 const MODULE_NAME = 'data-migration';
@@ -130,7 +132,28 @@ async function startImportJobFromIosPicker() {
     return requireJobId(payload, t`Import job id is missing`);
 }
 
+// The server host has no Downloads folder of its own: the browser downloads
+// the completed archive, and the server disposes of it after streaming it.
+async function downloadServerExportArchive(jobId) {
+    const response = await fetch(`/api/tauritavern/data-migration/export/download?id=${encodeURIComponent(jobId)}`, {
+        method: 'GET',
+        cache: 'no-store',
+    });
+    if (!response.ok) {
+        throw new Error(await readFailureMessage(response));
+    }
+
+    const disposition = response.headers.get('Content-Disposition') || '';
+    const fileName = /filename="([^"]+)"/.exec(disposition)?.[1] || 'tauritavern-data.zip';
+    await downloadBlobWithRuntime(await response.blob(), fileName, { fallbackName: 'tauritavern-data.zip' });
+    return { mode: 'browser', savedPath: '' };
+}
+
 async function saveExportArchive(jobId) {
+    if (isServerEnv()) {
+        return downloadServerExportArchive(jobId);
+    }
+
     if (isAndroidRuntime()) {
         const response = await fetch('/api/extensions/data-migration/export/android/save', {
             method: 'POST',
@@ -281,12 +304,14 @@ async function onImportButtonClick() {
             return;
         }
 
-        if (isAndroidRuntime()) {
+        // Native archive pickers exist only in the mobile app; a phone browser
+        // talking to the server host uses the ordinary file input.
+        if (!isServerEnv() && isAndroidRuntime()) {
             await onAndroidImportButtonClick();
             return;
         }
 
-        if (isIosRuntime()) {
+        if (!isServerEnv() && isIosRuntime()) {
             await onIosImportButtonClick();
             return;
         }

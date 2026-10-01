@@ -42,6 +42,10 @@ function versionKey(characterId, fileName) {
     return `character:${characterId}/${fileName}`;
 }
 
+function groupVersionKey(chatId) {
+    return `group:${chatId}`;
+}
+
 export function getLoadedChatVersion(characterId, fileName) {
     return loadedChatVersions.get(versionKey(characterId, fileName)) ?? null;
 }
@@ -78,8 +82,11 @@ async function requestServerChat(path, body) {
         throw error;
     }
 
-    return payload;
+    return { payload, headers: response.headers };
 }
+
+// Chat reads keep upstream's bare-array body; the revision rides in a header.
+const CHAT_VERSION_HEADER = 'x-tauritavern-chat-version';
 
 export async function loadCharacterChatPayload({ characterName, avatarUrl, fileName, allowNotFound = false }) {
     const normalizedCharacter = resolveCharacterDirectoryId(characterName, avatarUrl);
@@ -90,7 +97,7 @@ export async function loadCharacterChatPayload({ characterName, avatarUrl, fileN
     }
 
     if (isServerEnv()) {
-        const result = await requestServerChat('/api/chats/get', {
+        const { payload, headers } = await requestServerChat('/api/chats/get', {
             ch_name: characterName,
             avatar_url: avatarUrl,
             file_name: normalizedFile,
@@ -98,14 +105,15 @@ export async function loadCharacterChatPayload({ characterName, avatarUrl, fileN
         });
 
         const key = versionKey(normalizedCharacter, normalizedFile);
-        if (result?.version) {
-            loadedChatVersions.set(key, result.version);
+        const version = headers.get(CHAT_VERSION_HEADER);
+        if (version) {
+            loadedChatVersions.set(key, JSON.parse(version));
         } else {
             // No file yet: the next save must create it rather than replace one.
             loadedChatVersions.delete(key);
         }
 
-        return Array.isArray(result) ? result : (result?.chat ?? []);
+        return payload;
     }
 
     const path = await invoke('get_chat_payload_path', {
@@ -135,7 +143,7 @@ export async function saveCharacterChatPayload({ characterName, avatarUrl, fileN
     if (isServerEnv()) {
         const key = versionKey(normalizedCharacter, normalizedFile);
         const version = loadedChatVersions.get(key) ?? null;
-        const result = await requestServerChat('/api/chats/save', {
+        const { payload: result } = await requestServerChat('/api/chats/save', {
             ch_name: characterName,
             avatar_url: avatarUrl,
             file_name: normalizedFile,
@@ -165,12 +173,76 @@ export async function saveCharacterChatPayload({ characterName, avatarUrl, fileN
     });
 }
 
+/**
+ * Server mode: upstream SillyTavern extensions POST `/api/chats/save` without
+ * TT's `version`/`is_new`, which the server refuses. For the chat this page has
+ * open, attach the revision the page loaded so the server's stale-write check
+ * still applies. Returns null to leave the request untouched.
+ *
+ * @param {{ url: URL, input: unknown, init: RequestInit, send: typeof fetch, activeTarget: () => ({ characterId: string, fileName: string } | null) }} args
+ * @returns {Promise<Response> | null}
+ */
+export function adaptLegacyServerChatSave({ url, input, init, send, activeTarget }) {
+    if (!isServerEnv() || url.pathname !== '/api/chats/save' || typeof input !== 'string' && !(input instanceof URL)) {
+        return null;
+    }
+    if (String(init?.method || 'GET').toUpperCase() !== 'POST' || typeof init?.body !== 'string') {
+        return null;
+    }
+    let body;
+    try {
+        body = JSON.parse(init.body);
+    } catch {
+        return null;
+    }
+    if (!body || typeof body !== 'object' || 'version' in body || 'is_new' in body || body.force === true) {
+        return null;
+    }
+
+    const characterId = resolveCharacterDirectoryId(body.ch_name, body.avatar_url);
+    const fileName = normalizeChatFileName(body.file_name);
+    const active = activeTarget();
+    if (!characterId || !fileName.trim() || active?.characterId !== characterId || normalizeChatFileName(active.fileName) !== fileName) {
+        return null;
+    }
+    const key = versionKey(characterId, fileName);
+    const version = loadedChatVersions.get(key);
+    if (!version) {
+        return null;
+    }
+
+    return send(input, { ...init, body: JSON.stringify({ ...body, version, is_new: false }) }).then(async (response) => {
+        if (response.ok) {
+            const saved = await response.clone().json().catch(() => null);
+            // Advance only from the revision we sent; a newer save may have landed meanwhile.
+            if (saved?.version && loadedChatVersions.get(key) === version) {
+                loadedChatVersions.set(key, saved.version);
+            }
+        }
+        return response;
+    });
+}
+
 export async function loadGroupChatPayload({ id, allowNotFound = false }) {
     const normalizedId = normalizeChatFileName(id);
     if (!normalizedId.trim()) {
         throw new Error('Invalid group chat payload request');
     }
 
+    if (isServerEnv()) {
+        const { payload, headers } = await requestServerChat('/api/tauritavern/group-chats/get', {
+            id: normalizedId,
+            allow_not_found: allowNotFound,
+        });
+        const key = groupVersionKey(normalizedId);
+        const version = headers.get(CHAT_VERSION_HEADER);
+        if (version) {
+            loadedChatVersions.set(key, JSON.parse(version));
+        } else {
+            loadedChatVersions.delete(key);
+        }
+        return payload;
+    }
     const path = await invoke('get_group_chat_path', {
         id: normalizedId,
         allowNotFound,
@@ -193,6 +265,21 @@ export async function saveGroupChatPayload({ id, payload, force = false, commitR
         throw new Error('Invalid group chat payload');
     }
 
+    if (isServerEnv()) {
+        const key = groupVersionKey(normalizedId);
+        const version = loadedChatVersions.get(key) ?? null;
+        const { payload: result } = await requestServerChat('/api/tauritavern/group-chats/save', {
+            id: normalizedId,
+            chat: payload,
+            force,
+            version,
+            is_new: !version,
+        });
+        if (result?.version) {
+            loadedChatVersions.set(key, result.version);
+        }
+        return;
+    }
     await commitChatPayload({
         target: {
             kind: 'group',

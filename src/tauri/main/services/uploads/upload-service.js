@@ -338,7 +338,8 @@ export function createUploadService({ safeInvoke, invoke } = {}) {
         }
 
         const uploadKind = normalizeUploadKind(kind);
-        if (uploadKind === DATA_ARCHIVE_KIND) {
+        // Phone browsers on the server host have no native picker to fall back to.
+        if (uploadKind === DATA_ARCHIVE_KIND && !isServerEnv()) {
             if (isAndroidRuntime()) {
                 return {
                     filePath: '',

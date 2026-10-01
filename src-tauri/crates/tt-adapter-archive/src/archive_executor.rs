@@ -44,6 +44,7 @@ impl DataArchiveExecutor for FileDataArchiveExecutor {
         let result = run_export_data_archive(
             &request.data_root,
             &request.output_path,
+            request.include_secrets,
             report_progress,
             is_cancelled,
         )?;

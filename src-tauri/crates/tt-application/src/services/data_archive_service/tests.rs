@@ -731,6 +731,7 @@ async fn start_export_runs_executor_and_marks_completed() {
         data_root: PathBuf::from("/tmp/data-root"),
         output_path: output_path.clone(),
         file_name: "tauritavern-data.zip".to_string(),
+        include_secrets: false,
     }));
     let service = DataArchiveService::new(
         jobs,
@@ -741,7 +742,7 @@ async fn start_export_runs_executor_and_marks_completed() {
         Arc::new(UnusedReconciler),
     );
 
-    let job_id = service.start_export().expect("start export");
+    let job_id = service.start_export(false).expect("start export");
 
     let status = wait_for_job_state(&service, &job_id, DATA_ARCHIVE_STATE_COMPLETED).await;
     let result = status.result.expect("completed export result");
@@ -765,6 +766,7 @@ fn start_export_uses_runtime_handle_outside_tokio_context() {
         data_root: PathBuf::from("/tmp/data-root"),
         output_path: output_path.clone(),
         file_name: "tauritavern-data.zip".to_string(),
+        include_secrets: false,
     }));
     let service = DataArchiveService::new(
         jobs,
@@ -775,7 +777,7 @@ fn start_export_uses_runtime_handle_outside_tokio_context() {
         Arc::new(UnusedReconciler),
     );
 
-    let job_id = service.start_export().expect("start export");
+    let job_id = service.start_export(false).expect("start export");
 
     let status = runtime.block_on(wait_for_job_state(
         &service,
@@ -798,6 +800,7 @@ async fn start_export_cleans_partial_archive_on_failure() {
         data_root: PathBuf::from("/tmp/data-root"),
         output_path: output_path.clone(),
         file_name: "tauritavern-data.zip".to_string(),
+        include_secrets: false,
     }));
     let service = DataArchiveService::new(
         jobs,
@@ -810,7 +813,7 @@ async fn start_export_cleans_partial_archive_on_failure() {
         Arc::new(UnusedReconciler),
     );
 
-    let job_id = service.start_export().expect("start export");
+    let job_id = service.start_export(false).expect("start export");
 
     let status = wait_for_job_state(&service, &job_id, DATA_ARCHIVE_STATE_FAILED).await;
     assert_eq!(status.error.as_deref(), Some("Internal error: boom"));
@@ -845,6 +848,7 @@ async fn start_export_protects_claimed_completed_artifact_from_stale_cleanup() {
         data_root: PathBuf::from("/tmp/data-root"),
         output_path: PathBuf::from("/tmp/new-staged-export.zip"),
         file_name: "tauritavern-data.zip".to_string(),
+        include_secrets: false,
     }));
     let service = DataArchiveService::new(
         jobs,
@@ -855,7 +859,7 @@ async fn start_export_protects_claimed_completed_artifact_from_stale_cleanup() {
         Arc::new(UnusedReconciler),
     );
 
-    let _ = service.start_export().expect("start export");
+    let _ = service.start_export(false).expect("start export");
 
     assert_eq!(
         *files

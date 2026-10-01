@@ -97,15 +97,20 @@ pub async fn generate(
     let payload = request.payload;
 
     if request.background {
-        let id = request
-            .stream_id
-            .ok_or_else(|| ServerError::BadRequest("Background generation needs a stream id".into()))?;
+        let id = request.stream_id.ok_or_else(|| {
+            ServerError::BadRequest("Background generation needs a stream id".into())
+        })?;
         validate_stream_id(&id)?;
         let stream = wants_stream(&payload);
         let (job, created) = crate::background::get_or_insert(&id, stream);
         if created {
             let dto = serde_json::from_value(payload)?;
-            spawn_background(state.services.chat_completion_service.clone(), id, job.clone(), dto);
+            spawn_background(
+                state.services.chat_completion_service.clone(),
+                id,
+                job.clone(),
+                dto,
+            );
         }
         return Ok(background_response(&job, 0).await);
     }

@@ -57,7 +57,11 @@ impl Job {
             loop {
                 let (batch, done) = {
                     let state = rx.borrow_and_update();
-                    let batch = state.events.get(next..).map(<[_]>::to_vec).unwrap_or_default();
+                    let batch = state
+                        .events
+                        .get(next..)
+                        .map(<[_]>::to_vec)
+                        .unwrap_or_default();
                     (batch, state.done)
                 };
                 if !batch.is_empty() {
@@ -96,7 +100,10 @@ pub fn get_or_insert(id: &str, stream: bool) -> (Arc<Job>, bool) {
 }
 
 pub fn get(id: &str) -> Option<Arc<Job>> {
-    JOBS.lock().expect("background job map poisoned").get(id).cloned()
+    JOBS.lock()
+        .expect("background job map poisoned")
+        .get(id)
+        .cloned()
 }
 
 pub fn remove(id: &str) {
@@ -135,7 +142,10 @@ mod tests {
         assert_eq!(events.len(), 2, "{events:?}");
         assert!(events[0].contains("id: 1") && events[0].contains("data: b"));
         assert!(events[1].contains("id: 2") && events[1].contains("data: c"));
-        assert!(ids_and_data(&job, 3).await.is_empty(), "caught-up finished job ends");
+        assert!(
+            ids_and_data(&job, 3).await.is_empty(),
+            "caught-up finished job ends"
+        );
         remove("test-replay");
         assert!(get("test-replay").is_none());
     }

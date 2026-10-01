@@ -235,6 +235,19 @@ impl GroupChatService {
         Ok(path.to_string_lossy().to_string())
     }
 
+    /// Raw JSONL bytes of a group chat payload; the server derives the
+    /// revision token from the same bytes it returns.
+    pub async fn get_group_chat_payload_bytes(
+        &self,
+        chat_id: &str,
+    ) -> Result<Vec<u8>, ApplicationError> {
+        validate_chat_file_name(chat_id, "Group chat id")?;
+        Ok(self
+            .group_chat_repository
+            .get_group_chat_payload_bytes(chat_id)
+            .await?)
+    }
+
     /// Get the tail window for a group chat JSONL payload.
     pub async fn get_group_chat_payload_tail_lines(
         &self,

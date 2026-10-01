@@ -153,12 +153,15 @@ impl DataArchiveService {
         Ok(job_id)
     }
 
-    pub fn start_export(&self) -> Result<String, DomainError> {
+    /// Both hosts pass their key-exposure policy; disabled exports omit every
+    /// user's secrets.json and secrets-migration backup files.
+    pub fn start_export(&self, include_secrets: bool) -> Result<String, DomainError> {
         let job_id = Uuid::new_v4().simple().to_string();
         let protected_paths = self.jobs.protected_export_artifact_paths()?;
-        let request = self
+        let mut request = self
             .files
             .prepare_export_archive(&job_id, &protected_paths)?;
+        request.include_secrets = include_secrets;
         let output_path = request.output_path.clone();
         let job = Arc::new(DataArchiveJobHandle::new_export(
             &job_id,

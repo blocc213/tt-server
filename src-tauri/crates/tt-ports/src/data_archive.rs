@@ -14,6 +14,7 @@ pub struct ExportArchiveExecutionRequest {
     pub data_root: PathBuf,
     pub output_path: PathBuf,
     pub file_name: String,
+    pub include_secrets: bool,
 }
 
 pub struct UserBackupArchiveExecutionRequest {

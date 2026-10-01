@@ -52,6 +52,10 @@ test('server mode keeps non-native upstream routes in-page', async () => {
         assert.equal(shouldHandleInPage('/api/settings/get'), true);
         assert.equal(shouldHandleInPage('/api/characters/all'), true);
         assert.equal(shouldHandleInPage('/api/worldinfo/get'), true);
+        // Same prefix as the native chat-completion endpoints, but only the
+        // page implements these; a prefix match used to strand them on a 404.
+        assert.equal(shouldHandleInPage('/api/backends/chat-completions/bias'), true);
+        assert.equal(shouldHandleInPage('/api/backends/chat-completions/multimodal-models/workers_ai'), true);
     } finally {
         restore();
     }

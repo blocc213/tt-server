@@ -5,6 +5,7 @@ import {
     getClientVersion as getBridgeClientVersion,
     getTauriTavernSettings,
     invoke,
+    isServerEnv,
     openExternalUrl,
     updateTauriTavernSettings,
 } from '../../../tauri-bridge.js';
@@ -606,7 +607,7 @@ jQuery(async () => {
 
     const html = await renderExtensionTemplateAsync(MODULE_NAME, 'settings', LINKS);
     container.append(html);
-    $('#tauritavern_export_debug_bundle').on('click', () => void onExportDebugBundleClick());
+    $('#tauritavern_export_debug_bundle').toggle(!isServerEnv()).on('click', () => void onExportDebugBundleClick());
 
     const aboutCaps = resolveIosAboutCapabilities();
     if (aboutCaps && aboutCaps.git_info === false) {

@@ -1,4 +1,5 @@
 import { sanitizeAttachmentFileName } from '../binary-utils.js';
+import { isServerEnv } from '../../../tauri-bridge.js';
 
 function isNotFoundError(error) {
     const message = String(error?.message || error || '').toLowerCase();
@@ -115,6 +116,28 @@ export function registerBackupsRoutes(router, context, { jsonResponse, textRespo
         const name = String(body?.name || '').trim();
         if (!name) {
             return textResponse('Bad Request', 400);
+        }
+
+        if (isServerEnv()) {
+            try {
+                const content = await context.safeInvoke('read_chat_backup', { name });
+                return new Response(String(content ?? ''), {
+                    status: 200,
+                    headers: {
+                        'Content-Type': 'application/octet-stream',
+                        'Content-Disposition': `attachment; filename="${encodeURI(sanitizeAttachmentFileName(name, 'chat_backup.jsonl'))}"`,
+                    },
+                });
+            } catch (error) {
+                if (isNotFoundError(error)) {
+                    return textResponse('Not Found', 404);
+                }
+                if (isBadRequestError(error)) {
+                    return textResponse('Bad Request', 400);
+                }
+                console.error('Failed to download chat backup:', error);
+                return textResponse('Internal Server Error', 500);
+            }
         }
 
         let materializedPath = '';

@@ -6,6 +6,7 @@ export function createInterceptors({
     canHandleRequest,
     toUrl,
     routeRequest,
+    adaptNativeRequest = null,
     jsonResponse,
     safeJson,
 }) {
@@ -132,6 +133,10 @@ export function createInterceptors({
             }
 
             const requestUrl = toUrl(input, resolveWindowBaseUrl(targetWindow));
+            const adapted = requestUrl && adaptNativeRequest?.(requestUrl, input, init, delegateFetch, targetWindow);
+            if (adapted) {
+                return adapted;
+            }
             if (!requestUrl || !canHandleRequest(requestUrl, input, init, targetWindow)) {
                 return delegateFetch(input, init);
             }

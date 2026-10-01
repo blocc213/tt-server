@@ -24,6 +24,7 @@ struct ExportProgress {
 pub(crate) fn run_export_data_archive(
     data_root: &Path,
     output_path: &Path,
+    include_secrets: bool,
     report_progress: &mut dyn FnMut(&str, f32, &str),
     is_cancelled: &dyn Fn() -> bool,
 ) -> Result<DataArchiveExportResult, DomainError> {
@@ -31,7 +32,13 @@ pub(crate) fn run_export_data_archive(
         data_root,
         output_path,
         "data",
-        &|relative_path| !is_transient_chat_entry(relative_path),
+        &|relative_path| {
+            let mut components = relative_path.components();
+            components.next();
+            !is_transient_chat_entry(relative_path)
+                && !is_host_archive_staging_entry(relative_path)
+                && should_include_user_backup_entry(components.as_path(), include_secrets)
+        },
         report_progress,
         is_cancelled,
     )
@@ -320,6 +327,18 @@ fn is_transient_chat_entry(relative_path: &Path) -> bool {
     is_chat_backup_staging_entry(relative_path) || is_chat_commit_staging_entry(relative_path)
 }
 
+/// Archive and upload staging a host keeps inside the data root (the server
+/// host has no other private directory). Exporting it would zip the archive
+/// currently being written plus half-finished uploads.
+fn is_host_archive_staging_entry(relative_path: &Path) -> bool {
+    let components = path_components(relative_path);
+    matches!(
+        components.as_slice(),
+        [state, staging, ..]
+            if state == "_tauritavern" && (staging == "archive-imports" || staging == "archive-exports")
+    ) || matches!(components.as_slice(), [staging, ..] if staging == ".server-upload-staging")
+}
+
 fn report_export_progress(
     progress: &mut ExportProgress,
     report_progress: &mut dyn FnMut(&str, f32, &str),
@@ -348,6 +367,55 @@ mod tests {
             name,
             uuid::Uuid::new_v4().simple()
         ))
+    }
+
+    #[test]
+    fn full_export_honors_secret_exposure_for_every_user() {
+        let root = temp_root("secret-policy");
+        let source = root.join("data");
+        for user in ["default-user", "other-user"] {
+            let user_root = source.join(user);
+            fs::create_dir_all(user_root.join("backups")).unwrap();
+            fs::write(user_root.join("secrets.json"), "secret-canary").unwrap();
+            fs::write(
+                user_root.join("backups/secrets_migration_123.json"),
+                "secret-canary",
+            )
+            .unwrap();
+            fs::write(user_root.join("settings.json"), "{}").unwrap();
+        }
+        for include_secrets in [false, true] {
+            let output = root.join(format!("export-{include_secrets}.zip"));
+            run_export_data_archive(
+                &source,
+                &output,
+                include_secrets,
+                &mut |_, _, _| {},
+                &|| false,
+            )
+            .unwrap();
+            let mut archive = zip::ZipArchive::new(File::open(output).unwrap()).unwrap();
+            for user in ["default-user", "other-user"] {
+                assert_eq!(
+                    archive
+                        .by_name(&format!("data/{user}/secrets.json"))
+                        .is_ok(),
+                    include_secrets
+                );
+                assert_eq!(
+                    archive
+                        .by_name(&format!("data/{user}/backups/secrets_migration_123.json"))
+                        .is_ok(),
+                    include_secrets
+                );
+                assert!(
+                    archive
+                        .by_name(&format!("data/{user}/settings.json"))
+                        .is_ok()
+                );
+            }
+        }
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -427,6 +495,26 @@ mod tests {
     }
 
     #[test]
+    fn full_export_skips_host_archive_and_upload_staging() {
+        for staging in [
+            "_tauritavern/archive-exports/export-job.zip",
+            "_tauritavern/archive-imports/job/import.archive",
+            ".server-upload-staging/data-archive/upload.zip",
+        ] {
+            assert!(
+                is_host_archive_staging_entry(Path::new(staging)),
+                "{staging}"
+            );
+        }
+        for kept in [
+            "_tauritavern/skills/a.json",
+            "default-user/_tauritavern/archive-exports/x.zip",
+        ] {
+            assert!(!is_host_archive_staging_entry(Path::new(kept)), "{kept}");
+        }
+    }
+
+    #[test]
     fn export_refuses_to_overwrite_existing_archive() {
         let root = temp_root("existing-output");
         let source_root = root.join("source");
@@ -436,8 +524,13 @@ mod tests {
         fs::write(&output_path, b"keep me").expect("write existing output");
 
         let mut report_progress = |_stage: &str, _progress_percent: f32, _message: &str| {};
-        let result =
-            run_export_data_archive(&source_root, &output_path, &mut report_progress, &|| false);
+        let result = run_export_data_archive(
+            &source_root,
+            &output_path,
+            true,
+            &mut report_progress,
+            &|| false,
+        );
 
         assert!(result.is_err());
         assert_eq!(

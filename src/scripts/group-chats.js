@@ -57,6 +57,7 @@ import {
     select_selected_character,
     cancelTtsPlay,
     displayPastChats,
+    readChatImportError,
     sendMessageAsUser,
     getBiasStrings,
     saveChatConditional,
@@ -158,11 +159,14 @@ function setAutoModeWorker() {
  * @param {boolean} reload Whether to reload characters after saving
  */
 async function _save(group, reload = true) {
-    await fetch('/api/groups/edit', {
+    const response = await fetch('/api/groups/edit', {
         method: 'POST',
         headers: getRequestHeaders(),
         body: JSON.stringify(group),
     });
+    if (!response.ok) {
+        throw new Error(`Failed to save group ${group.id}: ${await readChatImportError(response)}`);
+    }
     if (reload) {
         await getCharacters();
     }
@@ -2427,6 +2431,7 @@ export async function deleteGroupChat(groupId, chatId, { jumpToNewChat = true } 
  * @param {object} [options={}] Options for the import
  * @param {boolean} [options.refresh] Whether to refresh the group chat list after import
  * @returns {Promise<string[]>} List of imported file names
+ * @throws {Error} When the import or the group link fails; the message carries the reason.
  */
 export async function importGroupChat(formData, { refresh = true } = {}) {
     const fetchResult = await fetch('/api/chats/group/import', {
@@ -2436,27 +2441,28 @@ export async function importGroupChat(formData, { refresh = true } = {}) {
         cache: 'no-cache',
     });
 
-    if (fetchResult.ok) {
-        const data = await fetchResult.json();
-        if (data.res) {
-            const chatId = data.res;
-            const group = groups.find(x => x.id == selected_group);
-
-            if (group) {
-                group.chats.push(chatId);
-                await editGroup(selected_group, true, true);
-                if (refresh) {
-                    await displayPastChats();
-                }
-            }
-
-            return [data.res];
-        }
-
-        return data?.fileNames || [];
+    if (!fetchResult.ok) {
+        throw new Error(await readChatImportError(fetchResult));
     }
 
-    return [];
+    const data = await fetchResult.json();
+    const chatId = typeof data?.res === 'string' ? data.res.trim() : '';
+    if (data?.error || !chatId) {
+        throw new Error(typeof data?.error === 'string' ? data.error : 'Group chat import returned no chat id');
+    }
+
+    const group = groups.find(x => x.id == selected_group);
+    if (!group) {
+        throw new Error(`Imported group chat ${chatId}, but no group is selected to link it to`);
+    }
+
+    group.chats.push(chatId);
+    await editGroup(selected_group, true, true);
+    if (refresh) {
+        await displayPastChats();
+    }
+
+    return [chatId];
 }
 
 /**

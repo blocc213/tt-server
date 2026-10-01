@@ -70,6 +70,19 @@ function withTauriArgumentAliases(args) {
     return aliased;
 }
 
+function toCamelCaseArgs(args) {
+    const camel = {};
+    for (const [key, value] of Object.entries(args)) {
+        const camelCaseKey = key.replace(/_+([a-zA-Z0-9])/g, (_, char) => char.toUpperCase());
+        // An explicit camelCase key wins over its snake_case twin, matching
+        // withTauriArgumentAliases.
+        if (camelCaseKey === key || !Object.prototype.hasOwnProperty.call(args, camelCaseKey)) {
+            camel[camelCaseKey] = value;
+        }
+    }
+    return camel;
+}
+
 /// Status -> the message prefix `resolveHostErrorResponse` parses back.
 ///
 /// Mirrors `CommandError`'s `#[error("...")]` strings so the in-page router
@@ -81,6 +94,7 @@ const ERROR_CATEGORY_PREFIXES = Object.freeze({
     403: 'Permission denied',
     404: 'Not found',
     409: 'Conflict',
+    413: 'Payload too large',
     429: 'Too many requests',
 });
 
@@ -120,10 +134,20 @@ async function invokeOverHttp(command, args, options) {
     });
 
     const text = await response.text();
-    const payload = text ? JSON.parse(text) : null;
 
     if (!response.ok) {
-        const message = payload?.error || `Command failed: ${command}`;
+        // Error bodies are not always JSON: axum's extractor rejections (413
+        // body limit, 400 parse errors) answer plain text. Parsing them as JSON
+        // replaced the real status with a SyntaxError and every such failure
+        // surfaced as a generic 500.
+        let message;
+        try {
+            message = JSON.parse(text)?.error;
+        } catch {
+            message = text.trim().slice(0, 500);
+        }
+        message ||= `Command failed: ${command}`;
+
         // Re-apply the category prefix the Tauri host's `CommandError` Display
         // emits (`presentation/errors.rs`). The server carries the category in
         // the HTTP status instead, and the in-page router maps errors back to
@@ -135,7 +159,7 @@ async function invokeOverHttp(command, args, options) {
         throw new Error(prefixErrorCategory(response.status, message));
     }
 
-    return payload;
+    return text ? JSON.parse(text) : null;
 }
 
 
@@ -148,7 +172,13 @@ export const invoke = (...args) => {
     // Re-checked per call rather than captured at module load: the flag is set
     // by init.js, and tests swap the host between imports.
     if (detectServerEnv()) {
-        return invokeOverHttp(command, normalizedArgs, args[2]);
+        // The server reads camelCase keys only (tauritavern-server/src/rpc.rs).
+        // Sending the aliased object would serialize every snake_case value
+        // twice, doubling large payloads such as base64 file uploads.
+        const httpArgs = args.length >= 2 && isPlainObject(commandArgs)
+            ? toCamelCaseArgs(commandArgs)
+            : commandArgs;
+        return invokeOverHttp(command, httpArgs, args[2]);
     }
 
     const fn = getTauri()?.core?.invoke;
@@ -257,12 +287,7 @@ export async function getTauriTavernSettings() {
 }
 
 export async function getChatBackupStorageStats() {
-    const invokeFn = getInvokeFn();
-    if (!invokeFn) {
-        throw new Error('Tauri invoke is unavailable');
-    }
-
-    return invokeFn('get_chat_backup_storage_stats');
+    return invoke('get_chat_backup_storage_stats');
 }
 
 export async function updateTauriTavernSettings(dto) {

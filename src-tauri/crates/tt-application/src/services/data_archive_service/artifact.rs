@@ -22,7 +22,6 @@ pub(super) struct CompletedExportArtifact {
 }
 
 impl DataArchiveService {
-    #[cfg(target_os = "ios")]
     pub fn completed_export_archive_path(&self, job_id: &str) -> Result<PathBuf, DomainError> {
         Ok(self.completed_export_artifact(job_id)?.archive_path)
     }

@@ -1,5 +1,6 @@
 import { Fuse, DOMPurify } from '../lib.js';
 import { canUseNegativeLookbehind, copyText, findPersona, flashHighlight, resolveAvatarData } from './utils.js';
+import { isServerEnv } from '../tauri-bridge.js';
 
 import {
     Generate,
@@ -3683,6 +3684,11 @@ export function initDefaultSlashCommands() {
         name: 'llmlog',
         aliases: ['apilog'],
         callback: async () => {
+            if (isServerEnv()) {
+                const message = t`LLM API logs are not available in server mode.`;
+                toastr.info(message);
+                return message;
+            }
             if (!window.__TAURITAVERN__?.api?.dev) {
                 toastr.error(t`LLM API logs are only available in TauriTavern.`);
                 return '';
@@ -3716,6 +3722,11 @@ export function initDefaultSlashCommands() {
     SlashCommandParser.addCommandObject(SlashCommand.fromProps({
         name: 'backendlog',
         callback: async () => {
+            if (isServerEnv()) {
+                const message = t`Backend logs are not available in server mode.`;
+                toastr.info(message);
+                return message;
+            }
             if (!window.__TAURITAVERN__?.api?.dev) {
                 toastr.error(t`Backend logs are only available in TauriTavern.`);
                 return '';

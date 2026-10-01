@@ -83,7 +83,6 @@ pub(super) fn install_runtime_resources(
         &runtime_paths.data_root,
     ));
     app.manage(Arc::new(UserMediaService::new(user_media_store)));
-
     app.manage(Arc::new(UserFileService::new(Arc::new(
         FilesystemUserFileStore::new(
             tt_domain::models::user_directory::UserDirectory::default_user(

@@ -1,24 +1,49 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
-import path from 'node:path';
-import { fileURLToPath } from 'node:url';
 
-const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+const source = await readFile(new URL('../src/scripts/tauri/setting/setting-panel/settings-view-model.js', import.meta.url), 'utf8');
+const body = source.replace(/^import\s+[\s\S]*?;\n/gm, '').replace(/^export /gm, '');
+const createModel = new Function('deps', `
+    const { isMobile, isAndroidRuntime, isIosRuntime, isServerEnv,
+        getActiveIosPolicyCapabilities, getRuntimePaths, getTauriTavernSettings,
+        syncNativeRegexBackendEnabledFromSettings, createDataRootState,
+        createTauriTavernSettingsState, isNativeRegexBackendEnabled } = deps;
+    ${body}
+    return { resolveTauriTavernSettingsCapabilities, loadTauriTavernSettingsViewModel };
+`);
 
-test('settings view model gates data directory selection by runtime (not Bowser isMobile)', async () => {
-    const viewModelPath = path.join(
-        REPO_ROOT,
-        'src/scripts/tauri/setting/setting-panel/settings-view-model.js',
-    );
-    const source = await readFile(viewModelPath, 'utf8');
+test('server settings do not request native runtime paths, including desktop-like browsers', async () => {
+    let runtimePathCalls = 0;
+    const model = createModel({
+        isMobile: () => false,
+        isAndroidRuntime: () => false,
+        isIosRuntime: () => false,
+        isServerEnv: () => true,
+        getActiveIosPolicyCapabilities: () => null,
+        getRuntimePaths: () => { runtimePathCalls++; throw new Error('native only'); },
+        getTauriTavernSettings: async () => ({}),
+        syncNativeRegexBackendEnabledFromSettings: () => {},
+        createDataRootState: paths => paths,
+        createTauriTavernSettingsState: settings => settings,
+        isNativeRegexBackendEnabled: () => false,
+    });
+    const result = await model.loadTauriTavernSettingsViewModel();
+    assert.equal(result.capabilities.supportsDataRootSelection, false);
+    assert.equal(result.capabilities.supportsNativeDevLogs, false);
+    assert.equal(result.dataRoot, null);
+    assert.equal(runtimePathCalls, 0);
+});
 
-    assert.match(
-        source,
-        /import\s+\{\s*isAndroidRuntime\s*,\s*isIosRuntime\s*\}\s+from\s+['"]\.\.\/\.\.\/\.\.\/util\/mobile-runtime\.js['"]\s*;/,
-    );
-    assert.match(source, /const\s+supportsDataRootSelection\s*=\s*!isAndroidRuntime\(\)\s*&&\s*!isIosRuntime\(\)\s*;/);
-    assert.doesNotMatch(source, /supportsDataRootSelection\s*=\s*!isMobile\(\)/);
-
-    assert.match(source, /const\s+runtimePaths\s*=\s*supportsDataRootSelection\s*\?\s*await\s+getRuntimePaths\(\)\s*:\s*null\s*;/);
+test('native data root selection excludes Android and desktop-like iPadOS', () => {
+    for (const [android, ios, expected] of [[false, false, true], [true, false, false], [false, true, false]]) {
+        const model = createModel({
+            isMobile: () => false,
+            isAndroidRuntime: () => android,
+            isIosRuntime: () => ios,
+            isServerEnv: () => false,
+            getActiveIosPolicyCapabilities: () => null,
+        });
+        assert.equal(model.resolveTauriTavernSettingsCapabilities().supportsDataRootSelection, expected);
+    }
 });

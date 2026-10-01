@@ -34,7 +34,13 @@ pub fn start_export_data_archive(
     app_state
         .services
         .data_archive_service
-        .start_export()
+        .start_export(
+            app_state
+                .services
+                .secret_service
+                .read_settings()
+                .allow_keys_exposure,
+        )
         .map_err(map_command_error("Failed to start data archive export"))
 }
 

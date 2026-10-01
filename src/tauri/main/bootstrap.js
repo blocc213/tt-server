@@ -44,6 +44,8 @@ import { registerRoutes, shouldHandleInPage } from './routes/index.js';
 import { isEmbeddedRuntimeTakeoverDisabled } from './services/embedded-runtime/embedded-runtime-profile-state.js';
 import { installFrontendLogCapture, setFrontendLogBackendForwardingEnabled } from './services/dev-logging/frontend-log-capture.js';
 import { preinstallPanelRuntime } from './services/panel-runtime/preinstall.js';
+import { getActiveChatSnapshot } from './adapters/st/active-chat-ref.js';
+import { adaptLegacyServerChatSave } from '../../scripts/tauri/chat/transport.js';
 let bootstrapped = false;
 const HOST_ABI_VERSION = 1;
 
@@ -356,12 +358,27 @@ export function bootstrapTauriMain() {
         }
     };
 
+    const activeCharacterChat = () => {
+        try {
+            const { ref } = getActiveChatSnapshot();
+            return ref.kind === 'character' ? ref : null;
+        } catch {
+            return null;
+        }
+    };
+    const adaptNativeRequest = (url, input, init, send, targetWindow) => (
+        url.origin === getWindowOrigin(targetWindow)
+            ? adaptLegacyServerChatSave({ url, input, init, send, activeTarget: activeCharacterChat })
+            : null
+    );
+
     const interceptors = createInterceptors({
         isTauri: true,
         originalFetch: window.fetch.bind(window),
         canHandleRequest,
         toUrl,
         routeRequest,
+        adaptNativeRequest,
         jsonResponse,
         safeJson,
     });

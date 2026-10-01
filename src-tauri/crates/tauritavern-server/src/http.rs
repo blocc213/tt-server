@@ -25,12 +25,33 @@ use crate::state::SharedState;
 /// runs.
 const MAX_REQUEST_BODY_BYTES: usize = 64 * 1024 * 1024;
 
+/// Upper bound for `/rpc/upload_user_file` only.
+///
+/// The payload is a whole file base64-encoded in JSON (~4/3 inflation), and
+/// LittleWhiteBox vector backups of long chats exceed 64 MiB once encoded.
+/// The route sits behind the session gate, so only authenticated clients can
+/// send a body this large; every other route keeps `MAX_REQUEST_BODY_BYTES`.
+const MAX_USER_FILE_UPLOAD_BYTES: usize = 128 * 1024 * 1024;
+
 pub fn router(state: SharedState) -> Router {
     let protected = Router::new()
         .route("/csrf-token", get(csrf_token))
         .route("/api/bootstrap", post(bootstrap))
         .route("/api/chats/get", post(crate::chat::get_chat))
         .route("/api/chats/save", post(crate::chat::save_chat))
+        .route("/api/users/backup", post(crate::archive::user_backup))
+        .route(
+            "/api/tauritavern/data-migration/export/download",
+            get(crate::archive::export_download),
+        )
+        .route(
+            "/api/tauritavern/group-chats/get",
+            post(crate::chat::get_group_chat),
+        )
+        .route(
+            "/api/tauritavern/group-chats/save",
+            post(crate::chat::save_group_chat),
+        )
         .route(
             "/api/backends/chat-completions/status",
             post(crate::generate::status),
@@ -50,6 +71,12 @@ pub fn router(state: SharedState) -> Router {
         .route(
             "/api/backends/chat-completions/resume",
             post(crate::generate::resume),
+        )
+        // Static segments win over `{command}`, so this route alone gets the
+        // larger ceiling while every other command keeps the global one.
+        .route(
+            "/rpc/upload_user_file",
+            post(upload_user_file).layer(DefaultBodyLimit::max(MAX_USER_FILE_UPLOAD_BYTES)),
         )
         .route("/rpc/{command}", post(rpc))
         .route("/rpc-raw/stage_upload_chunk", post(stage_upload_chunk))
@@ -226,11 +253,28 @@ async fn rpc(
     }
 }
 
+async fn upload_user_file(
+    State(state): State<SharedState>,
+    body: Option<Json<Value>>,
+) -> Result<Json<Value>, ServerError> {
+    rpc(
+        State(state),
+        axum::extract::Path("upload_user_file".to_string()),
+        body,
+    )
+    .await
+}
+
 const LOGIN_PAGE: &str = include_str!("login.html");
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
     use crate::auth::Auth;
+    use crate::state::AppState;
 
     #[test]
     fn open_auth_accepts_requests_without_a_cookie() {
@@ -253,5 +297,90 @@ mod tests {
             super::MAX_REQUEST_BODY_BYTES >= 64 * 1024 * 1024,
             "character card PNGs reach tens of megabytes"
         );
+    }
+
+    /// Sends `len` bytes of JSON-ish body and returns the HTTP status code.
+    ///
+    /// Raw socket so the test exercises the real router and its per-route
+    /// body limits, not just the constants.
+    async fn post_status(addr: std::net::SocketAddr, path: &str, len: usize) -> u16 {
+        let mut stream = tokio::net::TcpStream::connect(addr).await.expect("connect");
+        let head = format!(
+            "POST {path} HTTP/1.1\r\nHost: t\r\nContent-Type: application/json\r\nContent-Length: {len}\r\nConnection: close\r\n\r\n"
+        );
+        stream.write_all(head.as_bytes()).await.expect("head");
+        // A body that is valid-length but not valid JSON: under the limit the
+        // extractor answers 400, over it the body limit answers 413.
+        let chunk = vec![b' '; 1024 * 1024];
+        let mut sent = 0;
+        while sent < len {
+            let n = chunk.len().min(len - sent);
+            if stream.write_all(&chunk[..n]).await.is_err() {
+                break; // server may close early after rejecting
+            }
+            sent += n;
+        }
+        let mut response = Vec::new();
+        let _ = stream.read_to_end(&mut response).await;
+        let text = String::from_utf8_lossy(&response);
+        text.split_whitespace()
+            .nth(1)
+            .and_then(|code| code.parse().ok())
+            .unwrap_or(0)
+    }
+
+    #[tokio::test]
+    async fn only_user_file_upload_gets_the_larger_body_limit() {
+        let root = std::env::temp_dir().join(format!("tt-body-limit-{}", rand::random::<u64>()));
+        let services = crate::composition::build(
+            &root,
+            root.join("resources"),
+            Default::default(),
+            crate::product::USER_AGENT,
+        )
+        .await
+        .expect("build isolated server services");
+        let state = Arc::new(AppState {
+            services,
+            auth: Auth::new(None),
+            frontend_dir: root.join("frontend"),
+            csrf_token: "test".into(),
+            upload_staging: Arc::new(crate::upload::UploadStaging::new(&root)),
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, super::router(state))
+                .await
+                .expect("serve");
+        });
+
+        const MIB: usize = 1024 * 1024;
+        // The real failing backup was 82,829,791 bytes.
+        assert_eq!(
+            post_status(addr, "/rpc/upload_user_file", 80 * MIB).await,
+            400,
+            "80 MiB upload must pass the body limit"
+        );
+        assert_eq!(
+            post_status(addr, "/rpc/upload_user_file", 129 * MIB).await,
+            413,
+            "upload keeps a ceiling"
+        );
+        assert_eq!(
+            post_status(addr, "/rpc/verify_user_files", 70 * MIB).await,
+            413,
+            "other commands keep 64 MiB"
+        );
+        assert_eq!(
+            post_status(addr, "/api/login", 70 * MIB).await,
+            413,
+            "unauthenticated routes keep 64 MiB"
+        );
+
+        server.abort();
+        let _ = tokio::fs::remove_dir_all(root).await;
     }
 }

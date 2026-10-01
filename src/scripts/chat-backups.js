@@ -74,10 +74,12 @@ class BackupsBrowser {
         formData.set('character_name', context.name2);
 
         const importFn = context.groupId ? importGroupChat : importCharacterChat;
-        const result = await importFn(formData, { refresh: false });
-
-        if (result.length === 0) {
-            toastr.error(t`Failed to import chat backup, try again later.`);
+        let result;
+        try {
+            result = await importFn(formData, { refresh: false });
+        } catch (error) {
+            console.error('Failed to restore chat backup:', error);
+            toastr.error(`${error?.message || error}`, t`Failed to import chat backup, try again later.`);
             return;
         }
 

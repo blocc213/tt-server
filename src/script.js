@@ -8925,9 +8925,9 @@ export async function getChat({ allowNewChat = false } = {}) {
         if (!response.ok) {
             throw new Error('Chat could not be loaded');
         }
-        const responsePayload = await response.json();
-        const data = Array.isArray(responsePayload) ? responsePayload : responsePayload?.chat;
-        const loadedVersion = Array.isArray(responsePayload) ? null : responsePayload?.version;
+        const data = await response.json();
+        const versionHeader = response.headers.get('x-tauritavern-chat-version');
+        const loadedVersion = versionHeader ? JSON.parse(versionHeader) : null;
 
         const currentCharacter = startedChid !== undefined ? characters[startedChid] : null;
         const stillActive = startedSelectedGroup === selected_group
@@ -10857,8 +10857,9 @@ export async function saveChatConditional(commitReason = CHAT_COMMIT_REASON.MUTA
  * Saves the chat to the server.
  * @param {FormData} formData Form data to send to the server.
  * @param {object} [options={}] Options for the import
- * @param {boolean} [options.refresh] Whether to refresh the group chat list after import
+ * @param {boolean} [options.refresh] Whether to refresh the chat list after import
  * @returns {Promise<string[]>} List of imported file names.
+ * @throws {Error} When the import fails; the message carries the reason.
  */
 export async function importCharacterChat(formData, { refresh = true } = {}) {
     const fetchResult = await fetch('/api/chats/import', {
@@ -10868,15 +10869,37 @@ export async function importCharacterChat(formData, { refresh = true } = {}) {
         cache: 'no-cache',
     });
 
-    if (fetchResult.ok) {
-        const data = await fetchResult.json();
-        if (data.res && refresh) {
-            await displayPastChats();
-        }
-        return data?.fileNames || [];
+    if (!fetchResult.ok) {
+        throw new Error(await readChatImportError(fetchResult));
     }
 
-    return [];
+    const data = await fetchResult.json();
+    const fileNames = data?.fileNames;
+    if (data?.error || !data?.res || !Array.isArray(fileNames) || fileNames.length === 0) {
+        throw new Error(typeof data?.error === 'string' ? data.error : 'Chat import returned no file names');
+    }
+
+    if (refresh) {
+        await displayPastChats();
+    }
+    return fileNames;
+}
+
+/**
+ * Reads the failure reason from a chat import response (JSON `{ error }` or plain text).
+ * @param {Response} response
+ * @returns {Promise<string>}
+ */
+export async function readChatImportError(response) {
+    const text = (await response.text()).trim();
+    let reason = text;
+    try {
+        const data = JSON.parse(text);
+        reason = typeof data?.error === 'string' ? data.error : (data?.details || text);
+    } catch {
+        // Plain-text error bodies come from the shared route error boundary.
+    }
+    return reason || `HTTP ${response.status}`;
 }
 
 export function updateViewMessageIds() {
@@ -14056,39 +14079,50 @@ jQuery(async function () {
             return;
         }
 
-        const importedFileNames = [];
+        try {
+            const importedFileNames = [];
 
-        for (const file of targetElement.files) {
-            const ext = file.name.match(/\.(\w+)$/);
-            const format = ext?.[1]?.toLowerCase();
+            for (const file of targetElement.files) {
+                const ext = file.name.match(/\.(\w+)$/);
+                const format = ext?.[1]?.toLowerCase();
 
-            if (!['json', 'jsonl'].includes(format)) {
-                toastr.warning(t`Only JSON and JSONL files are supported for chat imports.`);
-                continue;
+                if (!['json', 'jsonl'].includes(format)) {
+                    toastr.warning(t`Only JSON and JSONL files are supported for chat imports.`);
+                    continue;
+                }
+
+                if (selected_group && format === 'json') {
+                    toastr.warning(t`Only SillyTavern's own format is supported for group chat imports. Sorry!`);
+                    continue;
+                }
+
+                const formData = new FormData(formElement);
+                formData.set('file_type', format);
+                formData.set('avatar', file);
+                formData.set('user_name', name1);
+
+                try {
+                    const importFn = selected_group ? importGroupChat : importCharacterChat;
+                    const result = await importFn(formData, { refresh: false });
+                    importedFileNames.push(...result);
+                } catch (error) {
+                    console.error(`Failed to import chat file ${file.name}`, error);
+                    toastr.error(`${file.name}: ${error?.message || error}`, t`Failed to import chat`);
+                }
             }
 
-            if (selected_group && format === 'json') {
-                toastr.warning(t`Only SillyTavern's own format is supported for group chat imports. Sorry!`);
-                continue;
+            if (importedFileNames.length > 0) {
+                toastr.success(t`Successfully imported ${importedFileNames.length} chat(s).`);
+                try {
+                    await displayPastChats(importedFileNames);
+                } catch (error) {
+                    console.error('Chats were imported, but the chat list failed to refresh', error);
+                    toastr.warning(t`Chats were imported, but the chat list failed to refresh. Reopen the chat list to see them.`);
+                }
             }
-
-            const formData = new FormData(formElement);
-            formData.set('file_type', format);
-            formData.set('avatar', file);
-            formData.set('user_name', name1);
-
-            const importFn = selected_group ? importGroupChat : importCharacterChat;
-            const result = await importFn(formData, { refresh: false });
-            importedFileNames.push(...result);
+        } finally {
+            targetElement.value = '';
         }
-
-        if (importedFileNames.length > 0) {
-            toastr.success(t`Successfully imported ${importedFileNames.length} chat(s).`);
-        }
-
-        await displayPastChats(importedFileNames);
-
-        targetElement.value = '';
     });
 
     $('#rm_button_group_chats').on('click', function () {

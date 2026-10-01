@@ -110,6 +110,7 @@ impl DataArchiveFileGateway for TauriDataArchiveFileGateway {
             data_root: runtime_paths.data_root.clone(),
             output_path: export_root.join(full_export_staging_file_name(job_id)),
             file_name,
+            include_secrets: false,
         })
     }
 

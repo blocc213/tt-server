@@ -1,9 +1,9 @@
 //! Server composition root.
 //!
-//! Mirrors the Tauri host's service graph for the subset the browser server
-//! needs. Native-only subsystems (LAN Sync, data archive, dev observability,
-//! notifications) are intentionally absent rather than stubbed: a server build
-//! should fail to expose them, not pretend they work.
+//! Mirrors the Tauri host's service graph for everything a browser can reach.
+//! Native-only subsystems (LAN Sync, OS pickers/share sheets, notifications,
+//! window control) are intentionally absent rather than stubbed: a server
+//! build should fail to expose them, not pretend they work.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -14,14 +14,17 @@ use tt_adapter_extension::FileExtensionRepository;
 use tt_adapter_http::{HttpClientPool, HttpExternalImportDownloader};
 use tt_adapter_media::{
     FileAvatarRepository, FileBackgroundRepository, FileImageMetadataRepository,
-    FilesystemHostResourceStore, FilesystemUserFileStore,
+    FilesystemHostResourceStore, FilesystemUserFileStore, FilesystemUserMediaStore,
 };
-use tt_adapter_provider_http::HttpChatCompletionRepository;
+use tt_adapter_provider_http::{
+    HttpChatCompletionRepository, HttpProviderMetadataRepository, HttpStableDiffusionRepository,
+    HttpTranslateRepository, HttpTtsRepository,
+};
 use tt_adapter_storage_core::{
-    DataDirectory, FileChatRepository, FileContentRepository, FileExtensionStoreRepository,
-    FileGroupRepository, FileLlmConnectionRepository, FilePresetRepository,
-    FilePromptCacheRepository, FileQuickReplyRepository, FileSecretRepository,
-    FileSettingsRepository, FileThemeRepository,
+    DataDirectory, FileAssetRepository, FileChatRepository, FileContentRepository,
+    FileExtensionStoreRepository, FileGroupRepository, FileLlmConnectionRepository,
+    FilePresetRepository, FilePromptCacheRepository, FileQuickReplyRepository,
+    FileSecretRepository, FileSettingsRepository, FileThemeRepository,
     chat_directory_identity::new_shared_chat_alias_store_for_user_dir,
 };
 use tt_adapter_storage_userdata::{
@@ -38,6 +41,7 @@ use tt_application::services::agent_runtime_service::AgentRuntimeService;
 use tt_application::services::agent_workspace_lifecycle_service::{
     AgentRunActivity, AgentWorkspaceLifecycleService,
 };
+use tt_application::services::asset_service::AssetService;
 use tt_application::services::avatar_service::AvatarService;
 use tt_application::services::background_service::BackgroundService;
 use tt_application::services::character_service::CharacterService;
@@ -46,8 +50,10 @@ use tt_application::services::chat_history_coordinator::ChatHistoryCoordinator;
 use tt_application::services::chat_payload_commit_service::ChatPayloadCommitService;
 use tt_application::services::chat_service::ChatService;
 use tt_application::services::content_service::ContentService;
+use tt_application::services::data_archive_service::{DataArchiveJobRegistry, DataArchiveService};
 use tt_application::services::extension_service::ExtensionService;
 use tt_application::services::extension_store_service::ExtensionStoreService;
+use tt_application::services::group_chat_service::GroupChatService;
 use tt_application::services::group_service::GroupService;
 use tt_application::services::host_resource_service::HostResourceService;
 use tt_application::services::image_metadata_service::ImageMetadataService;
@@ -55,13 +61,18 @@ use tt_application::services::llm_connection_service::LlmConnectionService;
 use tt_application::services::native_regex_service::NativeRegexService;
 use tt_application::services::preset_service::PresetService;
 use tt_application::services::prompt_assembly_service::PromptAssemblyService;
+use tt_application::services::provider_metadata_service::ProviderMetadataService;
 use tt_application::services::quick_reply_service::QuickReplyService;
 use tt_application::services::secret_service::SecretService;
 use tt_application::services::settings_service::{RequestProxyRuntime, SettingsService};
 use tt_application::services::skill_service::SkillService;
+use tt_application::services::stable_diffusion_service::StableDiffusionService;
 use tt_application::services::theme_service::ThemeService;
 use tt_application::services::tokenization_service::TokenizationService;
+use tt_application::services::translate_service::TranslateService;
+use tt_application::services::tts_service::TtsService;
 use tt_application::services::user_file_service::UserFileService;
+use tt_application::services::user_media_service::UserMediaService;
 use tt_application::services::world_info_service::WorldInfoService;
 use tt_domain::errors::DomainError;
 use tt_domain::ios_policy::{
@@ -69,6 +80,7 @@ use tt_domain::ios_policy::{
 };
 use tt_domain::models::settings::TauriTavernSettings;
 
+use crate::archive::{DataDirectoryInitializer, ServerDataArchiveFiles, ServiceCacheReconciler};
 use crate::resources::DirectoryResourceStore;
 
 /// Long-lived services shared by every HTTP request. Only services with a
@@ -77,6 +89,13 @@ use crate::resources::DirectoryResourceStore;
 pub struct ServerServices {
     pub character_service: Arc<CharacterService>,
     pub chat_service: Arc<ChatService>,
+    pub group_chat_service: Arc<GroupChatService>,
+    pub asset_service: Arc<AssetService>,
+    pub user_media_service: Arc<UserMediaService>,
+    pub provider_metadata_service: Arc<ProviderMetadataService>,
+    pub stable_diffusion_service: Arc<StableDiffusionService>,
+    pub translate_service: Arc<TranslateService>,
+    pub tts_service: Arc<TtsService>,
     pub chat_history_coordinator: Arc<ChatHistoryCoordinator>,
     pub chat_payload_commit_service: Arc<ChatPayloadCommitService>,
     pub settings_service: Arc<SettingsService>,
@@ -105,6 +124,7 @@ pub struct ServerServices {
     pub native_regex_service: Arc<NativeRegexService>,
     pub host_resource_service: Arc<HostResourceService>,
     pub user_file_service: Arc<UserFileService>,
+    pub data_archive_service: Arc<DataArchiveService>,
     pub ios_policy: IosPolicyActivationReport,
 }
 
@@ -185,6 +205,39 @@ pub async fn build(
 
     let chat_completion_repository =
         Arc::new(HttpChatCompletionRepository::new(http_client_pool.clone()));
+    let provider_metadata_service = Arc::new(ProviderMetadataService::new(
+        Arc::new(HttpProviderMetadataRepository::new(
+            http_client_pool.clone(),
+        )),
+        secret_repository.clone(),
+        resolve_ios_policy_activation_report(IosPolicyScope::Ignored, None)?,
+    ));
+    let stable_diffusion_service = Arc::new(StableDiffusionService::new(
+        Arc::new(HttpStableDiffusionRepository::new(
+            http_client_pool.clone(),
+            default_user_dir.join("user").join("workflows"),
+        )),
+        secret_repository.clone(),
+    ));
+    let translate_service = Arc::new(TranslateService::new(
+        Arc::new(HttpTranslateRepository::new(http_client_pool.clone())),
+        secret_repository.clone(),
+    ));
+    let tts_service = Arc::new(TtsService::new(
+        Arc::new(HttpTtsRepository::new(http_client_pool.clone())),
+        secret_repository.clone(),
+    ));
+    let asset_service = Arc::new(AssetService::new(
+        Arc::new(FileAssetRepository::new(
+            default_user_dir.clone(),
+            default_user_dir.join("assets"),
+            default_user_dir.join("characters"),
+        )),
+        Arc::new(HttpExternalImportDownloader::new(http_client_pool.clone())),
+    ));
+    let user_media_service = Arc::new(UserMediaService::new(Arc::new(
+        FilesystemUserMediaStore::from_data_root(&data_root),
+    )));
 
     // Services. Ordering follows the Tauri host so the two graphs stay comparable.
     let content_service = Arc::new(ContentService::new(
@@ -316,6 +369,11 @@ pub async fn build(
             data_directory.chats().to_path_buf(),
             data_directory.default_avatar().to_path_buf(),
         )),
+        agent_workspace_lifecycle_service.clone(),
+        chat_history_coordinator.clone(),
+    ));
+    let group_chat_service = Arc::new(GroupChatService::new(
+        file_chat_repository.clone(),
         agent_workspace_lifecycle_service,
         chat_history_coordinator.clone(),
     ));
@@ -334,14 +392,37 @@ pub async fn build(
         settings.avatar_persona_original_images_enabled,
         Arc::new(FilesystemHostResourceStore::from_data_root(&data_root)),
     ));
+
     let user_file_service = Arc::new(UserFileService::new(Arc::new(
         FilesystemUserFileStore::new(default_user_dir.join("user/files")),
     )));
-
+    let data_archive_service = Arc::new(DataArchiveService::new(
+        Arc::new(DataArchiveJobRegistry::new()),
+        tokio::runtime::Handle::current(),
+        Arc::new(tt_adapter_archive::FileDataArchiveExecutor),
+        Arc::new(ServerDataArchiveFiles::new(&data_root)),
+        Arc::new(DataDirectoryInitializer),
+        Arc::new(ServiceCacheReconciler {
+            character_service: character_service.clone(),
+            chat_service: chat_service.clone(),
+            group_chat_service: group_chat_service.clone(),
+            group_service: group_service.clone(),
+            secret_service: secret_service.clone(),
+            settings_service: settings_service.clone(),
+            chat_history_coordinator: chat_history_coordinator.clone(),
+        }),
+    ));
     Ok(ServerServices {
         character_service,
         chat_service,
         chat_history_coordinator,
+        group_chat_service,
+        asset_service,
+        user_media_service,
+        provider_metadata_service,
+        stable_diffusion_service,
+        translate_service,
+        tts_service,
         chat_payload_commit_service,
         settings_service,
         secret_service,
@@ -374,6 +455,7 @@ pub async fn build(
         native_regex_service: Arc::new(NativeRegexService::new()),
         host_resource_service,
         user_file_service,
+        data_archive_service,
         ios_policy,
     })
 }

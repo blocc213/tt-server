@@ -698,8 +698,8 @@ export function createTauriTavernSettingsApp(options) {
                     <div class="tt-settings-action-grid">
                         <ActionButton :label="tr('Reload Frontend')" icon="fa-arrows-rotate" @click="runAction('reloadFrontend')" />
                         <ActionButton :label="tr('Frontend Logs')" icon="fa-terminal" @click="runAction('openFrontendLogs')" />
-                        <ActionButton :label="tr('Backend Logs')" icon="fa-server" @click="runAction('openBackendLogs')" />
-                        <ActionButton :label="tr('LLM API Logs')" icon="fa-file-lines" @click="runAction('openLlmApiLogs')" />
+                        <ActionButton v-if="capabilities.supportsNativeDevLogs" :label="tr('Backend Logs')" icon="fa-server" @click="runAction('openBackendLogs')" />
+                        <ActionButton v-if="capabilities.supportsNativeDevLogs" :label="tr('LLM API Logs')" icon="fa-file-lines" @click="runAction('openLlmApiLogs')" />
                     </div>
                 </SettingsSection>
 

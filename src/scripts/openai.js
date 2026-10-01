@@ -2614,36 +2614,32 @@ export function normalizeChatCompletionSettingsForPromptAssembly(settings) {
  * @param {boolean?} [options.quiet=false] Suppress toast messages
  */
 export function tryParseStreamingError(response, decoded, { quiet = false } = {}) {
+    let data;
     try {
-        const data = JSON.parse(decoded);
-
-        if (!data) {
-            return;
-        }
-
-        checkQuotaError(data, { quiet });
-        checkModerationError(data, { quiet });
-
-        // these do not throw correctly (equiv to Error("[object Object]"))
-        // if trying to fix "[object Object]" displayed to users, start here
-
-        if (data.error) {
-            !quiet && toastr.error(data.error.message || response.statusText, 'Chat Completion API');
-            throw new Error(data);
-        }
-
-        if (data.message) {
-            !quiet && toastr.error(data.message, 'Chat Completion API');
-            throw new Error(data);
-        }
-
-        if (data.detail) {
-            !quiet && toastr.error(data.detail?.error?.message || response.statusText, 'Chat Completion API');
-            throw new Error(data);
-        }
-    }
-    catch {
+        data = JSON.parse(decoded);
+    } catch {
         // No JSON. Do nothing.
+        return;
+    }
+
+    if (!data) {
+        return;
+    }
+
+    checkQuotaError(data, { quiet });
+    checkModerationError(data, { quiet });
+
+    const message = data.error
+        ? (typeof data.error === 'string' ? data.error : (data.error.message || response.statusText))
+        : typeof data.message === 'string'
+            ? data.message
+            : data.detail
+                ? (data.detail?.error?.message || response.statusText)
+                : null;
+
+    if (message !== null) {
+        !quiet && toastr.error(message, 'Chat Completion API');
+        throw new Error(message || 'Chat Completion API error');
     }
 }
 

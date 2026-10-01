@@ -137,6 +137,11 @@ impl GroupChatRepository for FileChatRepository {
         Ok(path)
     }
 
+    async fn get_group_chat_payload_bytes(&self, chat_id: &str) -> Result<Vec<u8>, DomainError> {
+        let path = self.get_group_chat_payload_path(chat_id).await?;
+        self.read_payload_bytes_from_path(&path).await
+    }
+
     async fn get_group_chat_payload_tail_lines(
         &self,
         chat_id: &str,

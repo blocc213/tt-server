@@ -261,6 +261,33 @@ test('/api/chats/import keeps the upload contract when a Blob also carries backu
     assert.equal(cleaned, true);
 });
 
+test('/api/chats/import surfaces host import failures instead of a 200 error body', async () => {
+    let cleaned = false;
+    const router = createRouteRegistry();
+    registerChatRoutes(router, {
+        resolveCharacterId: async () => 'alice-id',
+        materializeUploadFile: async () => ({
+            filePath: '/tmp/upload.jsonl',
+            cleanup: async () => {
+                cleaned = true;
+            },
+        }),
+        safeInvoke: async () => {
+            throw new Error('Not found: Command `import_character_chats` is not available in server mode');
+        },
+    }, { jsonResponse });
+
+    const body = new FormData();
+    body.set('file_type', 'jsonl');
+    body.set('avatar', new Blob(['{"chat_metadata":{}}\n']), 'upload.jsonl');
+
+    const response = await router.handle({ method: 'POST', path: '/api/chats/import', body });
+
+    assert.equal(response.status, 404);
+    assert.match((await response.json()).error, /import_character_chats/);
+    assert.equal(cleaned, true);
+});
+
 test('chat backup browser views through a stream and restores by logical backup name', async () => {
     const source = await readFile(new URL('../src/scripts/chat-backups.js', import.meta.url), 'utf8');
     const routeSource = await readFile(new URL('../src/tauri/main/routes/backups-routes.js', import.meta.url), 'utf8');

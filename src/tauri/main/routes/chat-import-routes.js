@@ -1,4 +1,25 @@
+import { extractErrorText, resolveHostErrorResponse } from '../kernel/host-error-response.js';
 import { resolveRouteCharacterId } from './character-route-utils.js';
+
+function hostErrorResponse(jsonResponse, error) {
+    const resolved = resolveHostErrorResponse(extractErrorText(error));
+    return jsonResponse({ error: resolved.body }, resolved.status);
+}
+
+function importedFileNames(value) {
+    if (!Array.isArray(value) || value.length === 0 || !value.every(name => typeof name === 'string' && name)) {
+        throw new Error('Chat import returned no file names');
+    }
+    return value;
+}
+
+function importedGroupChatId(value) {
+    const chatId = typeof value === 'string' ? value.trim() : '';
+    if (!chatId) {
+        throw new Error('Group chat import returned no chat id');
+    }
+    return chatId;
+}
 
 export function registerChatImportRoutes(router, context, { jsonResponse }) {
     router.post('/api/chats/import', async ({ body }) => {
@@ -15,7 +36,7 @@ export function registerChatImportRoutes(router, context, { jsonResponse }) {
 
         const fileType = String(body.get('file_type') || '').trim().toLowerCase();
         if (!restoreFromBackup && !['json', 'jsonl'].includes(fileType)) {
-            return jsonResponse({ error: true });
+            return jsonResponse({ error: `Unsupported chat import format: ${fileType || '(none)'}` }, 400);
         }
 
         const characterDisplayName = String(body.get('character_name') || '').trim();
@@ -28,7 +49,7 @@ export function registerChatImportRoutes(router, context, { jsonResponse }) {
         }
         const characterId = resolved.characterId;
         if (!characterId) {
-            return jsonResponse({ error: true }, 400);
+            return jsonResponse({ error: 'Unable to resolve the target character for chat import' }, 400);
         }
 
         if (restoreFromBackup) {
@@ -41,12 +62,9 @@ export function registerChatImportRoutes(router, context, { jsonResponse }) {
                     },
                 });
 
-                return jsonResponse({
-                    res: true,
-                    fileNames: Array.isArray(fileNames) ? fileNames : [],
-                });
-            } catch {
-                return jsonResponse({ error: true });
+                return jsonResponse({ res: true, fileNames: importedFileNames(fileNames) });
+            } catch (error) {
+                return hostErrorResponse(jsonResponse, error);
             }
         }
 
@@ -72,12 +90,9 @@ export function registerChatImportRoutes(router, context, { jsonResponse }) {
                 },
             });
 
-            return jsonResponse({
-                res: true,
-                fileNames: Array.isArray(fileNames) ? fileNames : [],
-            });
-        } catch {
-            return jsonResponse({ error: true });
+            return jsonResponse({ res: true, fileNames: importedFileNames(fileNames) });
+        } catch (error) {
+            return hostErrorResponse(jsonResponse, error);
         } finally {
             await fileInfo.cleanup?.();
         }
@@ -96,14 +111,14 @@ export function registerChatImportRoutes(router, context, { jsonResponse }) {
                 const chatId = await context.safeInvoke('restore_group_chat_backup', {
                     dto: { backup_name: backupName },
                 });
-                return jsonResponse({ res: String(chatId || '') });
-            } catch {
-                return jsonResponse({ error: true });
+                return jsonResponse({ res: importedGroupChatId(chatId) });
+            } catch (error) {
+                return hostErrorResponse(jsonResponse, error);
             }
         }
 
         if (!(file instanceof Blob)) {
-            return jsonResponse({ error: true }, 400);
+            return jsonResponse({ error: 'No group chat file provided' }, 400);
         }
 
         const preferredName = file instanceof File && file.name ? file.name : 'group-chat.jsonl';
@@ -121,9 +136,9 @@ export function registerChatImportRoutes(router, context, { jsonResponse }) {
             const chatId = await context.safeInvoke('import_group_chat_payload', {
                 dto: { file_path: fileInfo.filePath },
             });
-            return jsonResponse({ res: String(chatId || '') });
-        } catch {
-            return jsonResponse({ error: true });
+            return jsonResponse({ res: importedGroupChatId(chatId) });
+        } catch (error) {
+            return hostErrorResponse(jsonResponse, error);
         } finally {
             await fileInfo.cleanup?.();
         }

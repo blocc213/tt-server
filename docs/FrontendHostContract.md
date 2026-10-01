@@ -4,6 +4,12 @@
 > 范围：仅覆盖前端宿主层（WebView 内运行的 Host Kernel）对外可观察的契约；不描述 Rust 后端内部实现。  
 > 参考：`docs/FrontendGuide.md`（集成架构与开发方式）
 
+### Server-mode product settings and development logs
+
+In `tauritavern-server` browser sessions (`isServerEnv()`), product settings do not request native runtime paths or offer data-root selection, close-to-tray, or native LAN sync. Chat backup storage statistics use the same `SettingsService`/`FileChatRepository` query as the desktop host via `get_chat_backup_storage_stats` over HTTP RPC; `null` means statistics are currently unavailable.
+
+Frontend log capture and its viewer remain available. Backend/LLM log viewers and debug-bundle export require desktop log stores backed by Tauri `AppHandle` and event emission, so their buttons are hidden in server mode. `/backendlog` and `/llmlog` (including `/apilog`) remain registered and return an informational “not available in server mode” message, without attempting native devlog RPCs.
+
 ---
 
 ## 1. 稳定性分级（写清楚“哪些能改，哪些不能随便改”）
@@ -238,6 +244,13 @@
 - 命中但无 handler：返回 `404` JSON（`{ error: "Unsupported endpoint: ..." }`）。
 
 > 这类行为会被上游与第三方依赖：不要改成 silent fail/空响应。
+
+服务器模式的上游聊天保存兼容（Public）：
+
+- 服务器模式下 `/api/chats/save` 由服务端处理，服务端要求 TT 的 `version`/`is_new`。上游 SillyTavern 扩展（如小白X）按原版协议保存，不带这两个字段。
+- `fetch` 拦截器对这类请求补上**本页已加载**的版本（`adaptLegacyServerChatSave`，`src/scripts/tauri/chat/transport.js`），成功后推进同一缓存。
+- 仅当：同源 `fetch(字符串/URL, { method: 'POST', body: JSON 字符串 })`、无 `version`/`is_new`、非 `force`、目标即当前打开的角色聊天、且本页已记录其版本。其余请求原样透传，由服务端照常判定。
+- 不读取服务器最新版本、不强制覆盖：版本过期仍被服务端拒绝，保留防旧页覆盖保护。群聊与桌面/移动端 IPC 路径不受影响。
 
 ### 4.3 路由表（Public）
 

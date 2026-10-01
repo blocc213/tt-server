@@ -30,18 +30,25 @@ import { registerVectorRoutes } from './vector-routes.js';
  * to produce, and generation must stream as SSE from the server rather than
  * being reassembled from an IPC channel.
  */
-const SERVER_NATIVE_PREFIXES = Object.freeze([
+const SERVER_NATIVE_ENDPOINTS = Object.freeze(new Set([
     '/csrf-token',
     '/api/bootstrap',
     '/api/chats/get',
     '/api/chats/save',
-    '/api/backends/chat-completions/',
-]);
+    '/api/tauritavern/group-chats/get',
+    '/api/tauritavern/group-chats/save',
+    '/api/users/backup',
+    '/api/backends/chat-completions/status',
+    '/api/backends/chat-completions/generate',
+    '/api/backends/chat-completions/cancel',
+    '/api/backends/chat-completions/cancel-generation',
+    '/api/backends/chat-completions/resume',
+]));
 
+// Exact paths only: a prefix would also swallow page-emulated siblings such as
+// `/api/backends/chat-completions/bias`, which the server does not serve.
 export function isServerNativeEndpoint(pathname) {
-    return SERVER_NATIVE_PREFIXES.some((prefix) => (
-        prefix.endsWith('/') ? pathname.startsWith(prefix) : pathname === prefix
-    ));
+    return SERVER_NATIVE_ENDPOINTS.has(pathname);
 }
 
 export function registerRoutes(router, context, responses) {

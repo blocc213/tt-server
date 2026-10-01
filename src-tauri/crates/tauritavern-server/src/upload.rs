@@ -128,7 +128,24 @@ impl UploadStaging {
     }
 
     pub async fn discard(&self, file_path: &str) -> Result<(), ServerError> {
-        let path = self.validate_path(file_path)?;
+        let path = match self.validate_path(file_path) {
+            Ok(path) => path,
+            Err(error) => {
+                let path = Path::new(file_path);
+                if std::fs::symlink_metadata(path)
+                    .is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound)
+                    && path.file_name().is_some()
+                    && path
+                        .parent()
+                        .and_then(Path::to_str)
+                        .is_some_and(|parent| self.validate_path(parent).is_ok())
+                {
+                    self.active.lock().await.remove(path);
+                    return Ok(());
+                }
+                return Err(error);
+            }
+        };
         self.active.lock().await.remove(&path);
         match tokio::fs::remove_file(&path).await {
             Ok(()) => Ok(()),
@@ -161,6 +178,29 @@ impl UploadStaging {
             return Err(ServerError::BadRequest(
                 "Upload path is outside the staging directory".into(),
             ));
+        }
+        let canonical_root = std::fs::canonicalize(&self.root).map_err(|_| {
+            ServerError::BadRequest("Upload staging directory is unavailable".into())
+        })?;
+        let canonical_path = std::fs::canonicalize(&path)
+            .map_err(|_| ServerError::BadRequest("Upload path is unavailable".into()))?;
+        if !canonical_path.starts_with(&canonical_root) {
+            return Err(ServerError::BadRequest(
+                "Upload path escapes staging directory".into(),
+            ));
+        }
+        let mut component_path = PathBuf::new();
+        for component in path.components() {
+            component_path.push(component.as_os_str());
+            if std::fs::symlink_metadata(&component_path)
+                .map_err(|_| ServerError::BadRequest("Upload path is unavailable".into()))?
+                .file_type()
+                .is_symlink()
+            {
+                return Err(ServerError::BadRequest(
+                    "Upload path contains a symlink".into(),
+                ));
+            }
         }
         Ok(path)
     }
@@ -220,11 +260,26 @@ mod tests {
                 .validate_path("/tmp/data/.server-upload-staging/../default-user/secrets.json")
                 .is_err()
         );
-        assert!(
-            staging
-                .validate_path("/tmp/data/.server-upload-staging/character/abc.png")
-                .is_ok()
-        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_symlinks_inside_staging() {
+        let root = std::env::temp_dir().join(format!("tt-upload-symlink-{}", random_id()));
+        let staging = UploadStaging::new(&root);
+        std::fs::create_dir_all(&staging.root).unwrap();
+        let outside = root.join("outside.json");
+        std::fs::write(&outside, "secret-canary").unwrap();
+        let link = staging.root.join("escape.json");
+        std::os::unix::fs::symlink(&outside, &link).unwrap();
+        assert!(matches!(
+            staging.validate_path(link.to_str().unwrap()),
+            Err(ServerError::BadRequest(_))
+        ));
+        let regular = staging.root.join("regular.json");
+        std::fs::write(&regular, "{}").unwrap();
+        assert!(staging.validate_path(regular.to_str().unwrap()).is_ok());
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

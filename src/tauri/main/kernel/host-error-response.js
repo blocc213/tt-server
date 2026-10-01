@@ -49,6 +49,15 @@ export function resolveHostErrorResponse(message) {
     if (lower.startsWith('too many requests:')) {
         return { status: 429, body: normalized };
     }
+    if (lower.startsWith('payload too large:')) {
+        return { status: 413, body: normalized };
+    }
+    // fetch() rejects with this when the connection dropped before any HTTP
+    // response arrived (reset, refused, offline). No server status exists, so
+    // report "unreachable" rather than pretend the server answered 500.
+    if (lower === 'failed to fetch' || lower.startsWith('networkerror') || lower === 'load failed') {
+        return { status: 503, body: `Network error: ${normalized}` };
+    }
     if (lower.startsWith('not found:') || lower.startsWith('entity not found:')) {
         return { status: 404, body: normalized };
     }

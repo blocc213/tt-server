@@ -69,6 +69,7 @@ const EXPOSED_COMMANDS: &[&str] = &[
     "get_client_version",
     "get_bootstrap_snapshot",
     "get_tauritavern_settings",
+    "get_chat_backup_storage_stats",
     "get_all_characters",
     "get_character",
     "get_character_chats_by_id",
@@ -85,6 +86,11 @@ const EXPOSED_COMMANDS: &[&str] = &[
     "stage_upload_begin",
     "stage_upload_finish",
     "stage_upload_discard",
+    "start_import_data_archive",
+    "start_export_data_archive",
+    "get_data_archive_job_status",
+    "cancel_data_archive_job",
+    "cleanup_export_data_archive",
     "create_character",
     "create_character_with_avatar",
     "import_character",
@@ -148,11 +154,13 @@ const EXPOSED_COMMANDS: &[&str] = &[
     "search_chats",
     "rename_chat",
     "delete_chat",
+    "import_character_chats",
     "upload_user_file",
     "delete_user_file",
     "verify_user_files",
     "sanitize_filename",
     "get_world_infos_batch",
+    "normalize_world_info_name",
     "get_avatars",
     "get_all_groups",
     "save_world_info",
@@ -213,6 +221,76 @@ const EXPOSED_COMMANDS: &[&str] = &[
     "delete_skill",
     "move_skill",
     "retarget_skill_scope",
+    // ---- groups / group chats ------------------------------------------------------
+    "get_group",
+    "create_group",
+    "update_group",
+    "delete_group",
+    "list_group_chat_summaries",
+    "list_recent_group_chat_summaries",
+    "search_group_chats",
+    "get_group_chat_payload_tail",
+    "get_group_chat_payload_before",
+    "get_group_chat_payload_before_pages",
+    "delete_group_chat",
+    "rename_group_chat",
+    "import_group_chat_payload",
+    "restore_group_chat_backup",
+    "get_group_chat_summary",
+    "get_group_chat_metadata",
+    "set_group_chat_metadata_extension",
+    "get_group_chat_store_json",
+    "set_group_chat_store_json",
+    "update_group_chat_store_json",
+    "rename_group_chat_store_key",
+    "delete_group_chat_store_json",
+    "list_group_chat_store_keys",
+    "find_last_group_chat_message",
+    "search_group_chat_messages",
+    // ---- character chat API / windows / backups ------------------------------------
+    "get_character_chat_summary",
+    "set_character_chat_metadata_extension",
+    "get_character_chat_store_json",
+    "set_character_chat_store_json",
+    "update_character_chat_store_json",
+    "rename_character_chat_store_key",
+    "delete_character_chat_store_json",
+    "list_character_chat_store_keys",
+    "find_last_character_chat_message",
+    "search_character_chat_messages",
+    "get_chat_payload_tail",
+    "get_chat_payload_before",
+    "get_chat_payload_before_pages",
+    "list_chat_backups",
+    "delete_chat_backup",
+    "restore_character_chat_backup",
+    "read_chat_backup",
+    // ---- world info / presets ---------------------------------------------------------
+    "import_world_info",
+    "restore_preset",
+    // ---- media / assets ---------------------------------------------------------------
+    "upload_avatar",
+    "delete_avatar",
+    "upload_user_image",
+    "list_user_images",
+    "list_user_image_folders",
+    "delete_user_image",
+    "get_assets_library",
+    "download_asset",
+    "delete_asset",
+    "get_character_assets",
+    // ---- providers / SD / translate / TTS --------------------------------------------
+    "get_openrouter_model_providers",
+    "get_openrouter_credits",
+    "get_nanogpt_model_providers",
+    "get_nanogpt_credits",
+    "get_siliconflow_embedding_models",
+    "get_workers_ai_embedding_models",
+    "get_workers_ai_multimodal_models",
+    "sd_handle",
+    "cancel_sd_request",
+    "translate_text",
+    "tts_handle",
 ];
 
 /// Rejects any filesystem path the browser did not get from upload staging.
@@ -291,6 +369,11 @@ async fn run(state: &Arc<AppState>, command: &str, args: Value) -> Handled {
             .services
             .settings_service
             .get_tauritavern_settings()
+            .await?),
+        "get_chat_backup_storage_stats" => ok(state
+            .services
+            .settings_service
+            .get_chat_backup_storage_stats()
             .await?),
 
         // ---- characters ------------------------------------------------------------
@@ -415,6 +498,39 @@ async fn run(state: &Arc<AppState>, command: &str, args: Value) -> Handled {
             .upload_staging
             .discard(&arg::<String>(&args, "filePath")?)
             .await?),
+
+        // ---- data migration ---------------------------------------------------------
+        // Export delivery is the `/api/tauritavern/data-migration/export/download`
+        // route; the app host's Downloads-folder save has no server meaning.
+        "start_import_data_archive" => {
+            let archive_path = arg::<String>(&args, "archivePath")?;
+            staged(state, &archive_path)?;
+            // Every staged upload is a temporary copy the job may consume.
+            ok(state
+                .services
+                .data_archive_service
+                .start_import(std::path::Path::new(&archive_path), true)?)
+        }
+        "start_export_data_archive" => ok(state.services.data_archive_service.start_export(
+            state
+                .services
+                .secret_service
+                .read_settings()
+                .allow_keys_exposure,
+        )?),
+        "get_data_archive_job_status" => ok(state
+            .services
+            .data_archive_service
+            .get_status(&arg::<String>(&args, "jobId")?)?),
+        "cancel_data_archive_job" => ok(state.services.data_archive_service.cancel(&arg::<
+            String,
+        >(
+            &args, "jobId",
+        )?)?),
+        "cleanup_export_data_archive" => ok(state
+            .services
+            .data_archive_service
+            .cleanup_export(&arg::<String>(&args, "jobId")?)?),
 
         // ---- character files --------------------------------------------------------
         "create_character" => ok(state
@@ -934,6 +1050,15 @@ async fn run(state: &Arc<AppState>, command: &str, args: Value) -> Handled {
                 &arg::<String>(&args, "fileName")?,
             )
             .await?),
+        "import_character_chats" => {
+            let dto: tt_application::dto::chat_dto::ImportCharacterChatsDto = arg(&args, "dto")?;
+            staged(state, &dto.file_path)?;
+            ok(state
+                .services
+                .chat_service
+                .import_character_chats(dto)
+                .await?)
+        }
 
         // ---- world info / presets / themes -----------------------------------------
         "get_world_infos_batch" => {
@@ -947,6 +1072,17 @@ async fn run(state: &Arc<AppState>, command: &str, args: Value) -> Handled {
                 .get_world_infos_batch(dto.names)
                 .await?;
             ok(GetWorldInfosBatchResponseDto { items })
+        }
+        "normalize_world_info_name" => {
+            use tt_application::dto::world_info_dto::{
+                NormalizeWorldInfoNameDto, NormalizeWorldInfoNameResponseDto,
+            };
+            let dto: NormalizeWorldInfoNameDto = arg(&args, "dto")?;
+            let name = state
+                .services
+                .world_info_service
+                .normalize_world_info_name(&dto.name, dto.import_filename)?;
+            ok(NormalizeWorldInfoNameResponseDto { name })
         }
         "get_avatars" => ok(state.services.avatar_service.get_avatars().await?),
         "get_all_groups" => ok(state
@@ -1442,11 +1578,617 @@ async fn run(state: &Arc<AppState>, command: &str, args: Value) -> Handled {
             .skill_service
             .retarget_scope(arg(&args, "request")?)
             .await?),
+        // ---- groups ------------------------------------------------------------------
+        "get_group" => ok(state
+            .services
+            .group_service
+            .get_group(&arg::<String>(&args, "id")?)
+            .await?
+            .map(tt_application::dto::group_dto::GroupDto::from)),
+        "create_group" => ok(tt_application::dto::group_dto::GroupDto::from(
+            state
+                .services
+                .group_service
+                .create_group(arg(&args, "dto")?)
+                .await?,
+        )),
+        "update_group" => ok(tt_application::dto::group_dto::GroupDto::from(
+            state
+                .services
+                .group_service
+                .update_group(arg(&args, "dto")?)
+                .await?,
+        )),
+        "delete_group" => ok(state
+            .services
+            .group_service
+            .delete_group(arg(&args, "dto")?)
+            .await?),
+
+        // ---- group chats -------------------------------------------------------------
+        "list_group_chat_summaries" => ok(state
+            .services
+            .group_chat_service
+            .list_group_chat_summaries(
+                opt_arg::<Vec<String>>(&args, "chatIds")?.as_deref(),
+                opt_arg(&args, "includeMetadata")?.unwrap_or(false),
+            )
+            .await?),
+        "list_recent_group_chat_summaries" => {
+            let pinned =
+                opt_arg::<Vec<tt_application::dto::chat_dto::PinnedGroupChatDto>>(&args, "pinned")?
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(Into::into)
+                    .collect::<Vec<_>>();
+            ok(state
+                .services
+                .group_chat_service
+                .list_recent_group_chat_summaries(
+                    opt_arg::<Vec<String>>(&args, "chatIds")?.as_deref(),
+                    opt_arg(&args, "includeMetadata")?.unwrap_or(false),
+                    opt_arg(&args, "maxEntries")?.unwrap_or(usize::MAX),
+                    &pinned,
+                )
+                .await?)
+        }
+        "search_group_chats" => ok(state
+            .services
+            .group_chat_service
+            .search_group_chats(
+                &arg::<String>(&args, "query")?,
+                opt_arg::<Vec<String>>(&args, "chatIds")?.as_deref(),
+            )
+            .await?),
+        "get_group_chat_payload_tail" => {
+            let result = state
+                .services
+                .group_chat_service
+                .get_group_chat_payload_tail_lines(
+                    &arg::<String>(&args, "id")?,
+                    arg(&args, "maxLines")?,
+                )
+                .await;
+            payload_tail(result, opt_arg(&args, "allowNotFound")?.unwrap_or(false))
+        }
+        "get_group_chat_payload_before" => ok(state
+            .services
+            .group_chat_service
+            .get_group_chat_payload_before_lines(
+                &arg::<String>(&args, "id")?,
+                arg(&args, "cursor")?,
+                arg(&args, "maxLines")?,
+            )
+            .await?),
+        "get_group_chat_payload_before_pages" => ok(state
+            .services
+            .group_chat_service
+            .get_group_chat_payload_before_pages_lines(
+                &arg::<String>(&args, "id")?,
+                arg(&args, "cursor")?,
+                arg(&args, "maxLines")?,
+                arg(&args, "maxPages")?,
+            )
+            .await?),
+        "delete_group_chat" => ok(state
+            .services
+            .group_chat_service
+            .delete_group_chat(arg(&args, "dto")?)
+            .await?),
+        "rename_group_chat" => ok(state
+            .services
+            .group_chat_service
+            .rename_group_chat(arg(&args, "dto")?)
+            .await?),
+        "import_group_chat_payload" => {
+            let dto: tt_application::dto::chat_dto::ImportGroupChatDto = arg(&args, "dto")?;
+            staged(state, &dto.file_path)?;
+            ok(state
+                .services
+                .group_chat_service
+                .import_group_chat(dto)
+                .await?)
+        }
+        "restore_group_chat_backup" => ok(state
+            .services
+            .group_chat_service
+            .restore_group_chat_backup(arg(&args, "dto")?)
+            .await?),
+        "get_group_chat_summary" => ok(state
+            .services
+            .group_chat_service
+            .get_group_chat_summary(
+                &arg::<String>(&args, "chatId")?,
+                opt_arg(&args, "includeMetadata")?.unwrap_or(false),
+            )
+            .await?),
+        "get_group_chat_metadata" => ok(state
+            .services
+            .group_chat_service
+            .get_group_chat_metadata(&arg::<String>(&args, "chatId")?)
+            .await?),
+        "set_group_chat_metadata_extension" => ok(state
+            .services
+            .group_chat_service
+            .set_group_chat_metadata_extension(
+                &arg::<String>(&args, "chatId")?,
+                &arg::<String>(&args, "namespace")?,
+                arg(&args, "value")?,
+            )
+            .await?),
+        "get_group_chat_store_json" => ok(state
+            .services
+            .group_chat_service
+            .get_group_chat_store_json(
+                &arg::<String>(&args, "chatId")?,
+                &arg::<String>(&args, "namespace")?,
+                &arg::<String>(&args, "key")?,
+            )
+            .await?),
+        "set_group_chat_store_json" => ok(state
+            .services
+            .group_chat_service
+            .set_group_chat_store_json(
+                &arg::<String>(&args, "chatId")?,
+                &arg::<String>(&args, "namespace")?,
+                &arg::<String>(&args, "key")?,
+                arg(&args, "value")?,
+            )
+            .await?),
+        "update_group_chat_store_json" => ok(state
+            .services
+            .group_chat_service
+            .update_group_chat_store_json(
+                &arg::<String>(&args, "chatId")?,
+                &arg::<String>(&args, "namespace")?,
+                &arg::<String>(&args, "key")?,
+                arg(&args, "value")?,
+            )
+            .await?),
+        "rename_group_chat_store_key" => ok(state
+            .services
+            .group_chat_service
+            .rename_group_chat_store_key(
+                &arg::<String>(&args, "chatId")?,
+                &arg::<String>(&args, "namespace")?,
+                &arg::<String>(&args, "key")?,
+                &arg::<String>(&args, "newKey")?,
+            )
+            .await?),
+        "delete_group_chat_store_json" => ok(state
+            .services
+            .group_chat_service
+            .delete_group_chat_store_json(
+                &arg::<String>(&args, "chatId")?,
+                &arg::<String>(&args, "namespace")?,
+                &arg::<String>(&args, "key")?,
+            )
+            .await?),
+        "list_group_chat_store_keys" => ok(state
+            .services
+            .group_chat_service
+            .list_group_chat_store_keys(
+                &arg::<String>(&args, "chatId")?,
+                &arg::<String>(&args, "namespace")?,
+            )
+            .await?),
+        "find_last_group_chat_message" => ok(state
+            .services
+            .group_chat_service
+            .find_last_group_chat_message(&arg::<String>(&args, "chatId")?, arg(&args, "query")?)
+            .await?),
+        "search_group_chat_messages" => ok(state
+            .services
+            .group_chat_service
+            .search_group_chat_messages(&arg::<String>(&args, "chatId")?, arg(&args, "query")?)
+            .await?),
+
+        // ---- character chat API ------------------------------------------------------
+        "get_character_chat_summary" => ok(state
+            .services
+            .chat_service
+            .get_character_chat_summary(
+                &arg::<String>(&args, "characterName")?,
+                &arg::<String>(&args, "fileName")?,
+                opt_arg(&args, "includeMetadata")?.unwrap_or(false),
+            )
+            .await?),
+        "set_character_chat_metadata_extension" => ok(state
+            .services
+            .chat_service
+            .set_character_chat_metadata_extension(
+                &arg::<String>(&args, "characterName")?,
+                &arg::<String>(&args, "fileName")?,
+                &arg::<String>(&args, "namespace")?,
+                arg(&args, "value")?,
+            )
+            .await?),
+        "get_character_chat_store_json" => ok(state
+            .services
+            .chat_service
+            .get_character_chat_store_json(
+                &arg::<String>(&args, "characterName")?,
+                &arg::<String>(&args, "fileName")?,
+                &arg::<String>(&args, "namespace")?,
+                &arg::<String>(&args, "key")?,
+            )
+            .await?),
+        "set_character_chat_store_json" => ok(state
+            .services
+            .chat_service
+            .set_character_chat_store_json(
+                &arg::<String>(&args, "characterName")?,
+                &arg::<String>(&args, "fileName")?,
+                &arg::<String>(&args, "namespace")?,
+                &arg::<String>(&args, "key")?,
+                arg(&args, "value")?,
+            )
+            .await?),
+        "update_character_chat_store_json" => ok(state
+            .services
+            .chat_service
+            .update_character_chat_store_json(
+                &arg::<String>(&args, "characterName")?,
+                &arg::<String>(&args, "fileName")?,
+                &arg::<String>(&args, "namespace")?,
+                &arg::<String>(&args, "key")?,
+                arg(&args, "value")?,
+            )
+            .await?),
+        "rename_character_chat_store_key" => ok(state
+            .services
+            .chat_service
+            .rename_character_chat_store_key(
+                &arg::<String>(&args, "characterName")?,
+                &arg::<String>(&args, "fileName")?,
+                &arg::<String>(&args, "namespace")?,
+                &arg::<String>(&args, "key")?,
+                &arg::<String>(&args, "newKey")?,
+            )
+            .await?),
+        "delete_character_chat_store_json" => ok(state
+            .services
+            .chat_service
+            .delete_character_chat_store_json(
+                &arg::<String>(&args, "characterName")?,
+                &arg::<String>(&args, "fileName")?,
+                &arg::<String>(&args, "namespace")?,
+                &arg::<String>(&args, "key")?,
+            )
+            .await?),
+        "list_character_chat_store_keys" => ok(state
+            .services
+            .chat_service
+            .list_character_chat_store_keys(
+                &arg::<String>(&args, "characterName")?,
+                &arg::<String>(&args, "fileName")?,
+                &arg::<String>(&args, "namespace")?,
+            )
+            .await?),
+        "find_last_character_chat_message" => ok(state
+            .services
+            .chat_service
+            .find_last_character_chat_message(
+                &arg::<String>(&args, "characterName")?,
+                &arg::<String>(&args, "fileName")?,
+                arg(&args, "query")?,
+            )
+            .await?),
+        "search_character_chat_messages" => ok(state
+            .services
+            .chat_service
+            .search_character_chat_messages(
+                &arg::<String>(&args, "characterName")?,
+                &arg::<String>(&args, "fileName")?,
+                arg(&args, "query")?,
+            )
+            .await?),
+        "get_chat_payload_tail" => {
+            let result = state
+                .services
+                .chat_service
+                .get_chat_payload_tail_lines(
+                    &arg::<String>(&args, "characterName")?,
+                    &arg::<String>(&args, "fileName")?,
+                    arg(&args, "maxLines")?,
+                )
+                .await;
+            payload_tail(result, opt_arg(&args, "allowNotFound")?.unwrap_or(false))
+        }
+        "get_chat_payload_before" => ok(state
+            .services
+            .chat_service
+            .get_chat_payload_before_lines(
+                &arg::<String>(&args, "characterName")?,
+                &arg::<String>(&args, "fileName")?,
+                arg(&args, "cursor")?,
+                arg(&args, "maxLines")?,
+            )
+            .await?),
+        "get_chat_payload_before_pages" => ok(state
+            .services
+            .chat_service
+            .get_chat_payload_before_pages_lines(
+                &arg::<String>(&args, "characterName")?,
+                &arg::<String>(&args, "fileName")?,
+                arg(&args, "cursor")?,
+                arg(&args, "maxLines")?,
+                arg(&args, "maxPages")?,
+            )
+            .await?),
+
+        // ---- chat backups ------------------------------------------------------------
+        "list_chat_backups" => ok(state.services.chat_service.list_chat_backups().await?),
+        "delete_chat_backup" => ok(state
+            .services
+            .chat_service
+            .delete_chat_backup(&arg::<String>(&args, "name")?)
+            .await?),
+        "restore_character_chat_backup" => ok(state
+            .services
+            .chat_service
+            .restore_character_chat_backup(arg(&args, "dto")?)
+            .await?),
+        // Server analogue of materialize + stream + discard: the materialized
+        // file is a server path the browser cannot open, so return its text.
+        "read_chat_backup" => {
+            let path = state
+                .services
+                .chat_service
+                .materialize_chat_backup(&arg::<String>(&args, "name")?)
+                .await?;
+            let content = tokio::fs::read_to_string(&path).await;
+            let discarded = state
+                .services
+                .chat_service
+                .discard_chat_backup_materialization(&path)
+                .await;
+            let content = content.map_err(|error| {
+                ServerError::Internal(format!("Failed to read chat backup: {error}"))
+            })?;
+            discarded?;
+            ok(content)
+        }
+
+        // ---- world info / presets ----------------------------------------------------
+        "import_world_info" => {
+            let dto: tt_application::dto::world_info_dto::ImportWorldInfoDto = arg(&args, "dto")?;
+            if !dto.file_path.trim().is_empty() {
+                staged(state, &dto.file_path)?;
+            }
+            let name = state
+                .services
+                .world_info_service
+                .import_world_info(&dto.file_path, &dto.original_filename, dto.converted_data)
+                .await?;
+            ok(tt_application::dto::world_info_dto::ImportWorldInfoResponseDto { name })
+        }
+        "restore_preset" => {
+            use tt_application::dto::preset_dto::{RestorePresetDto, RestorePresetResponseDto};
+            let dto: RestorePresetDto = arg(&args, "dto")?;
+            if dto.name.trim().is_empty() {
+                return Err(ServerError::BadRequest(
+                    "Preset name cannot be empty".into(),
+                ));
+            }
+            let preset_type = tt_domain::models::preset::PresetType::from_api_id(&dto.api_id)
+                .ok_or_else(|| {
+                    ServerError::BadRequest(format!("Unknown API ID: {}", dto.api_id))
+                })?;
+            match state
+                .services
+                .preset_service
+                .restore_default_preset(&dto.name, &preset_type)
+                .await?
+            {
+                Some(preset) => ok(RestorePresetResponseDto::new(true, preset.data)),
+                None => ok(RestorePresetResponseDto::not_found()),
+            }
+        }
+
+        // ---- persona avatars / user images / assets ----------------------------------
+        "upload_avatar" => {
+            let file_path: String = arg(&args, "filePath")?;
+            staged(state, &file_path)?;
+            let crop = match opt_arg::<String>(&args, "crop")? {
+                Some(crop) => Some(
+                    serde_json::from_str::<tt_domain::models::avatar::CropInfo>(&crop).map_err(
+                        |error| {
+                            ServerError::BadRequest(format!(
+                                "Invalid avatar crop information: {error}"
+                            ))
+                        },
+                    )?,
+                ),
+                None => None,
+            };
+            ok(state
+                .services
+                .avatar_service
+                .upload_avatar(
+                    std::path::Path::new(&file_path),
+                    opt_arg(&args, "overwriteName")?,
+                    crop,
+                )
+                .await?)
+        }
+        "delete_avatar" => ok(state
+            .services
+            .avatar_service
+            .delete_avatar(&arg::<String>(&args, "avatar")?)
+            .await?),
+        "upload_user_image" => ok(state
+            .services
+            .user_media_service
+            .upload_user_image(
+                tt_application::services::user_media_service::UploadUserImageInput {
+                    image_base64: arg(&args, "imageBase64")?,
+                    format: arg(&args, "format")?,
+                    filename: opt_arg(&args, "filename")?,
+                    ch_name: opt_arg(&args, "chName")?,
+                },
+            )
+            .await?),
+        "list_user_images" => ok(state
+            .services
+            .user_media_service
+            .list_user_images(
+                tt_application::services::user_media_service::ListUserImagesInput {
+                    folder: arg(&args, "folder")?,
+                    sort_field: opt_arg(&args, "sortField")?,
+                    sort_order: opt_arg(&args, "sortOrder")?,
+                    media_type: opt_arg(&args, "mediaType")?,
+                },
+            )
+            .await?),
+        "list_user_image_folders" => ok(state
+            .services
+            .user_media_service
+            .list_user_image_folders()
+            .await?),
+        "delete_user_image" => ok(state
+            .services
+            .user_media_service
+            .delete_user_image(&arg::<String>(&args, "path")?)
+            .await?),
+        "get_assets_library" => ok(state.services.asset_service.list_assets().await?),
+        "download_asset" => ok(state
+            .services
+            .asset_service
+            .download_asset(
+                &arg::<String>(&args, "url")?,
+                &arg::<String>(&args, "category")?,
+                &arg::<String>(&args, "filename")?,
+            )
+            .await?),
+        "delete_asset" => ok(state
+            .services
+            .asset_service
+            .delete_asset_file(
+                &arg::<String>(&args, "category")?,
+                &arg::<String>(&args, "filename")?,
+            )
+            .await?),
+        "get_character_assets" => ok(state
+            .services
+            .asset_service
+            .list_character_assets(
+                &arg::<String>(&args, "name")?,
+                &arg::<String>(&args, "category")?,
+            )
+            .await?),
+
+        // ---- provider metadata -------------------------------------------------------
+        "get_openrouter_model_providers" => ok(state
+            .services
+            .provider_metadata_service
+            .openrouter_model_providers(arg(&args, "dto")?)
+            .await?),
+        "get_openrouter_credits" => ok(state
+            .services
+            .provider_metadata_service
+            .openrouter_credits()
+            .await?),
+        "get_nanogpt_model_providers" => ok(state
+            .services
+            .provider_metadata_service
+            .nanogpt_model_providers(arg(&args, "dto")?)
+            .await?),
+        "get_nanogpt_credits" => ok(state
+            .services
+            .provider_metadata_service
+            .nanogpt_credits()
+            .await?),
+        "get_siliconflow_embedding_models" => ok(state
+            .services
+            .provider_metadata_service
+            .siliconflow_embedding_models(arg(&args, "dto")?)
+            .await?),
+        "get_workers_ai_embedding_models" => ok(state
+            .services
+            .provider_metadata_service
+            .workers_ai_embedding_models(arg(&args, "dto")?)
+            .await?),
+        "get_workers_ai_multimodal_models" => ok(state
+            .services
+            .provider_metadata_service
+            .workers_ai_multimodal_models(arg(&args, "dto")?)
+            .await?),
+
+        // ---- image generation / translation / TTS ------------------------------------
+        "sd_handle" => {
+            let request_id = request_id(&args)?;
+            ok(state
+                .services
+                .stable_diffusion_service
+                .handle_request(&request_id, arg(&args, "path")?, arg(&args, "body")?)
+                .await?)
+        }
+        "cancel_sd_request" => {
+            let request_id = request_id(&args)?;
+            state
+                .services
+                .stable_diffusion_service
+                .cancel_request(&request_id)
+                .await;
+            ok(Value::Null)
+        }
+        "translate_text" => ok(state
+            .services
+            .translate_service
+            .translate(&arg::<String>(&args, "provider")?, arg(&args, "body")?)
+            .await?),
+        "tts_handle" => ok(state
+            .services
+            .tts_service
+            .handle_request(arg(&args, "path")?, arg(&args, "body")?)
+            .await?),
 
         other => Err(ServerError::NotFound(format!(
             "Command `{other}` is not available in server mode"
         ))),
     }
+}
+
+/// Mirrors the desktop tail commands: a missing chat with `allowNotFound` is an
+/// empty window, not an error.
+fn payload_tail(
+    result: Result<
+        tt_ports::repositories::chat_types::ChatPayloadTail,
+        tt_application::errors::ApplicationError,
+    >,
+    allow_not_found: bool,
+) -> Handled {
+    use tt_application::errors::ApplicationError;
+    use tt_ports::repositories::chat_types::{ChatPayloadCursor, ChatPayloadTail};
+    match result {
+        Ok(tail) => ok(tail),
+        Err(ApplicationError::NotFound(_)) if allow_not_found => ok(ChatPayloadTail {
+            header: String::new(),
+            lines: Vec::new(),
+            cursor: ChatPayloadCursor {
+                offset: 0,
+                size: 0,
+                modified_millis: 0,
+            },
+            has_more_before: false,
+        }),
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// Same rule as `stable_diffusion_commands::validate_request_id`.
+fn request_id(args: &Value) -> Result<String, ServerError> {
+    let request_id = arg::<String>(args, "requestId")?.trim().to_string();
+    if request_id.is_empty()
+        || request_id.len() > 128
+        || !request_id
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_')
+    {
+        return Err(ServerError::BadRequest("Invalid request id".into()));
+    }
+    Ok(request_id)
 }
 
 #[cfg(test)]
@@ -1499,6 +2241,285 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn world_info_name_normalization_uses_browser_dto_and_import_semantics() {
+        let root =
+            std::env::temp_dir().join(format!("tt-world-name-rpc-{}", rand::random::<u64>()));
+        let services = crate::composition::build(
+            &root,
+            root.join("resources"),
+            Default::default(),
+            crate::product::USER_AGENT,
+        )
+        .await
+        .expect("build isolated server services");
+        let state = Arc::new(AppState {
+            services,
+            auth: crate::auth::Auth::new(None),
+            frontend_dir: root.join("frontend"),
+            csrf_token: "test".into(),
+            upload_staging: Arc::new(crate::upload::UploadStaging::new(&root)),
+        });
+        let normalize = |dto: Value| {
+            let state = state.clone();
+            async move {
+                dispatch(&state, "normalize_world_info_name", json!({ "dto": dto }))
+                    .await
+                    .expect("normalize command exposed")
+            }
+        };
+
+        for (dto, expected) in [
+            (json!({"name": "角色世界书"}), "角色世界书"),
+            (json!({"name": "a:b*c?", "import_filename": false}), "abc"),
+            (
+                json!({"name": "Lore.json", "import_filename": false}),
+                "Lore.json",
+            ),
+            (
+                json!({"name": "Lore.json", "import_filename": true}),
+                "Lore",
+            ),
+            (
+                json!({"name": "file.name.with.dots.json", "import_filename": true}),
+                "file.name.with.dots",
+            ),
+            (
+                json!({"name": " Lore.json", "import_filename": true}),
+                " Lore",
+            ),
+        ] {
+            assert_eq!(
+                normalize(dto.clone()).await.expect("normalize name"),
+                json!({ "name": expected }),
+                "{dto}"
+            );
+        }
+        for name in ["", "CON"] {
+            let error = normalize(json!({"name": name}))
+                .await
+                .expect_err("invalid name must be rejected");
+            assert_eq!(error.status(), http::StatusCode::BAD_REQUEST, "{name:?}");
+        }
+
+        drop(state);
+        tokio::fs::remove_dir_all(root)
+            .await
+            .expect("remove test data");
+    }
+
+    #[tokio::test]
+    async fn group_chats_round_trip_with_revision_checks_and_staged_imports() {
+        use axum::extract::State;
+        use axum::response::IntoResponse as _;
+
+        let root = std::env::temp_dir().join(format!("tt-group-rpc-{}", rand::random::<u64>()));
+        let services = crate::composition::build(
+            &root,
+            root.join("resources"),
+            Default::default(),
+            crate::product::USER_AGENT,
+        )
+        .await
+        .expect("build isolated server services");
+        let state = Arc::new(AppState {
+            services,
+            auth: crate::auth::Auth::new(None),
+            frontend_dir: root.join("frontend"),
+            csrf_token: "test".into(),
+            upload_staging: Arc::new(crate::upload::UploadStaging::new(&root)),
+        });
+
+        let group = dispatch(
+            &state,
+            "create_group",
+            json!({"dto": {"name": "三人组", "members": ["a.png", "b.png"]}}),
+        )
+        .await
+        .expect("create_group exposed")
+        .expect("create group");
+        let chat_id = group["chat_id"].as_str().expect("chat id").to_string();
+
+        let save = |chat: Value, version: Option<Value>, is_new: bool| {
+            let state = state.clone();
+            let chat_id = chat_id.clone();
+            async move {
+                let request: crate::chat::SaveGroupChatRequest = serde_json::from_value(json!({
+                    "id": chat_id, "chat": chat, "version": version, "is_new": is_new,
+                }))
+                .expect("save request");
+                let response =
+                    match crate::chat::save_group_chat(State(state), axum::Json(request)).await {
+                        Ok(response) => response,
+                        Err(error) => error.into_response(),
+                    };
+                let status = response.status();
+                let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .expect("body");
+                (
+                    status,
+                    serde_json::from_slice::<Value>(&body).unwrap_or(Value::Null),
+                )
+            }
+        };
+
+        let header = json!({"chat_metadata": {}});
+        let first = json!([header, {"name": "a", "mes": "第一句"}]);
+        let (status, saved) = save(first.clone(), None, true).await;
+        assert_eq!(status, http::StatusCode::OK, "{saved}");
+        let first_version = saved["version"].clone();
+
+        let (status, saved) = save(
+            json!([header, {"name": "a", "mes": "第二句"}]),
+            Some(first_version.clone()),
+            false,
+        )
+        .await;
+        assert_eq!(status, http::StatusCode::OK, "{saved}");
+
+        // A tab still holding the first revision must not clobber the second.
+        let (status, body) = save(first, Some(first_version), false).await;
+        assert_eq!(status, http::StatusCode::BAD_REQUEST);
+        assert_eq!(body, json!({"error": "integrity"}));
+
+        let read = crate::chat::get_group_chat(
+            State(state.clone()),
+            axum::Json(serde_json::from_value(json!({"id": chat_id})).expect("get request")),
+        )
+        .await
+        .expect("read group chat");
+        assert!(
+            read.headers()
+                .contains_key(crate::chat::CHAT_VERSION_HEADER)
+        );
+        let body = axum::body::to_bytes(read.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let payload: Value = serde_json::from_slice(&body).expect("json");
+        assert_eq!(payload[1]["mes"], "第二句");
+
+        let tail = dispatch(
+            &state,
+            "get_group_chat_payload_tail",
+            json!({"id": "missing", "maxLines": 10, "allowNotFound": true}),
+        )
+        .await
+        .expect("tail exposed")
+        .expect("missing chat with allowNotFound is an empty window");
+        assert_eq!(tail["lines"], json!([]));
+
+        // Imports name server paths; only staged uploads may be read.
+        let secrets = root.join("default-user").join("secrets.json");
+        for (command, args) in [
+            (
+                "import_world_info",
+                json!({"dto": {"file_path": secrets, "original_filename": "x.json"}}),
+            ),
+            (
+                "import_group_chat_payload",
+                json!({"dto": {"file_path": secrets}}),
+            ),
+        ] {
+            let error = dispatch(&state, command, args)
+                .await
+                .expect("command exposed")
+                .expect_err("unstaged path must be rejected");
+            assert_eq!(error.status(), http::StatusCode::BAD_REQUEST, "{command}");
+        }
+
+        drop(state);
+        tokio::fs::remove_dir_all(root)
+            .await
+            .expect("remove test data");
+    }
+
+    #[tokio::test]
+    async fn import_character_chats_reads_only_staged_uploads_and_preserves_bytes() {
+        let root =
+            std::env::temp_dir().join(format!("tt-chat-import-rpc-{}", rand::random::<u64>()));
+        let services = crate::composition::build(
+            &root,
+            root.join("resources"),
+            Default::default(),
+            crate::product::USER_AGENT,
+        )
+        .await
+        .expect("build isolated server services");
+        let state = Arc::new(AppState {
+            services,
+            auth: crate::auth::Auth::new(None),
+            frontend_dir: root.join("frontend"),
+            csrf_token: "test".into(),
+            upload_staging: Arc::new(crate::upload::UploadStaging::new(&root)),
+        });
+        let payload = concat!(
+            r#"{"chat_metadata":{"variables":{"k":1},"TavernDB_ACU_X":"keep"},"user_name":"我","character_name":"角色"}"#,
+            "\n",
+            r#"{"name":"角色","is_user":false,"mes":"你好","swipes":["你好","嗨"],"swipe_id":0,"extra":{"plugin":{"a":1}},"TavernDB_ACU_IsolatedData":{"x":2}}"#,
+        );
+        let bytes = payload.as_bytes();
+        let staged_upload = state
+            .upload_staging
+            .begin("chat-import", "jsonl", bytes.len() as u64)
+            .await
+            .expect("begin upload");
+        state
+            .upload_staging
+            .append(&staged_upload.file_path, 0, bytes)
+            .await
+            .expect("append upload");
+        let file_path = state
+            .upload_staging
+            .finish(&staged_upload.file_path, bytes.len() as u64)
+            .await
+            .expect("finish upload");
+        let dto = |path: &str| {
+            json!({"dto": {
+                "character_name": "角色",
+                "character_display_name": "角色",
+                "user_name": "我",
+                "file_path": path,
+                "file_type": "jsonl",
+            }})
+        };
+
+        let outside = root.join("outside.jsonl");
+        tokio::fs::write(&outside, bytes)
+            .await
+            .expect("write outside file");
+        let escaped = root.join(".server-upload-staging/../outside.jsonl");
+        for rejected in [outside.to_string_lossy(), escaped.to_string_lossy()] {
+            assert!(matches!(
+                dispatch(&state, "import_character_chats", dto(&rejected)).await,
+                Some(Err(ServerError::BadRequest(_)))
+            ));
+        }
+
+        let files = dispatch(&state, "import_character_chats", dto(&file_path))
+            .await
+            .expect("import command exposed")
+            .expect("import staged chat");
+        let file_name = files[0].as_str().expect("imported file name");
+        let imported = tokio::fs::read(root.join("default-user/chats/角色").join(file_name))
+            .await
+            .expect("read imported chat");
+        let mut chats = tokio::fs::read_dir(root.join("default-user/chats/角色"))
+            .await
+            .expect("list chats");
+        let mut count = 0;
+        assert_eq!(imported, bytes);
+        while chats.next_entry().await.expect("read chat entry").is_some() {
+            count += 1;
+        }
+        assert_eq!(count, 1, "rejected paths must not create chats");
+
+        drop(state);
+        tokio::fs::remove_dir_all(root)
+            .await
+            .expect("remove test data");
+    }
+
+    #[tokio::test]
     async fn user_file_commands_preserve_browser_contract_and_confine_writes() {
         let root =
             std::env::temp_dir().join(format!("tt-user-files-rpc-{}", rand::random::<u64>()));
@@ -1521,20 +2542,39 @@ mod tests {
         let name = "LittleWhiteBox_Assistant.json";
         let path = format!("/user/files/{name}");
         let target = files_dir.join(name);
-        let upload = |data: &str| json!({"name": name, "dataBase64": BASE64_STANDARD.encode(data.as_bytes())});
-        for content in [r#"{"模型":"测试"}"#, r#"{"模型":"覆盖"}"#] {
-            assert_eq!(
-                dispatch(&state, "upload_user_file", upload(content))
-                    .await
-                    .expect("command exposed")
-                    .expect("upload"),
-                json!({"path": path})
-            );
-            assert_eq!(
-                tokio::fs::read(&target).await.expect("read uploaded bytes"),
-                content.as_bytes()
-            );
-        }
+        let payload = r#"{"模型":"测试"}"#;
+        let upload = |data: &str| {
+            json!({
+                "name": name,
+                "dataBase64": BASE64_STANDARD.encode(data.as_bytes()),
+            })
+        };
+
+        assert_eq!(
+            dispatch(&state, "upload_user_file", upload(payload))
+                .await
+                .expect("upload exposed")
+                .expect("upload file"),
+            json!({"path": path}),
+        );
+        assert_eq!(
+            tokio::fs::read(&target).await.expect("read uploaded bytes"),
+            payload.as_bytes()
+        );
+        let replacement = r#"{"模型":"覆盖"}"#;
+        assert_eq!(
+            dispatch(&state, "upload_user_file", upload(replacement))
+                .await
+                .expect("overwrite exposed")
+                .expect("overwrite file"),
+            json!({"path": path}),
+        );
+        assert_eq!(
+            tokio::fs::read(&target)
+                .await
+                .expect("read overwritten bytes"),
+            replacement.as_bytes()
+        );
         assert_eq!(
             dispatch(
                 &state,
@@ -1542,20 +2582,20 @@ mod tests {
                 json!({"urls": [path, "/user/files/missing.json"]})
             )
             .await
-            .expect("command exposed")
-            .expect("verify"),
-            json!({"/user/files/LittleWhiteBox_Assistant.json": true, "/user/files/missing.json": false})
+            .expect("verify exposed")
+            .expect("verify files"),
+            json!({"/user/files/LittleWhiteBox_Assistant.json": true, "/user/files/missing.json": false}),
         );
         assert_eq!(
             dispatch(&state, "sanitize_filename", json!({"fileName": "a/b"}))
                 .await
-                .expect("command exposed")
-                .expect("sanitize"),
-            json!(tt_domain::models::filename::sanitize_filename("a/b"))
+                .expect("sanitize exposed")
+                .expect("sanitize file name"),
+            json!(tt_domain::models::filename::sanitize_filename("a/b")),
         );
         assert!(matches!(
             dispatch(&state, "sanitize_filename", json!({"fileName": ""})).await,
-            Some(Err(ServerError::BadRequest(_)))
+            Some(Err(ServerError::BadRequest(_))),
         ));
 
         let outside = root.join("default-user/user/secrets.json");
@@ -1575,10 +2615,13 @@ mod tests {
                     dispatch(
                         &state,
                         "upload_user_file",
-                        json!({"name": invalid, "dataBase64": BASE64_STANDARD.encode(b"unsafe")})
+                        json!({
+                            "name": invalid,
+                            "dataBase64": BASE64_STANDARD.encode(b"unsafe"),
+                        })
                     )
                     .await,
-                    Some(Err(ServerError::BadRequest(_)))
+                    Some(Err(ServerError::BadRequest(_))),
                 ),
                 "upload accepted {invalid}"
             );
@@ -1591,7 +2634,7 @@ mod tests {
             assert!(
                 matches!(
                     dispatch(&state, "delete_user_file", json!({"path": invalid})).await,
-                    Some(Err(ServerError::BadRequest(_)))
+                    Some(Err(ServerError::BadRequest(_))),
                 ),
                 "delete accepted {invalid}"
             );
@@ -1601,17 +2644,23 @@ mod tests {
             b"untouched"
         );
         assert!(!root.join("default-user/user/x.json").exists());
+        assert!(!files_dir.join("a").exists());
+        assert_eq!(
+            tokio::fs::read(&target).await.expect("read surviving file"),
+            replacement.as_bytes()
+        );
+
         assert_eq!(
             dispatch(&state, "delete_user_file", json!({"path": path}))
                 .await
-                .expect("command exposed")
-                .expect("delete"),
-            Value::Null
+                .expect("delete exposed")
+                .expect("delete file"),
+            Value::Null,
         );
         assert!(!target.exists());
         assert!(matches!(
             dispatch(&state, "delete_user_file", json!({"path": path})).await,
-            Some(Err(ServerError::NotFound(_)))
+            Some(Err(ServerError::NotFound(_))),
         ));
         drop(state);
         tokio::fs::remove_dir_all(root)

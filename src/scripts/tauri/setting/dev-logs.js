@@ -1,4 +1,5 @@
 import { POPUP_TYPE } from '../../popup.js';
+import { isServerEnv } from '../../../tauri-bridge.js';
 import { translate } from '../../i18n.js';
 import { trimFrontendLogEntriesInPlace } from '../../../tauri/main/services/dev-logging/frontend-log-retention.js';
 import { openFullscreenTextViewer } from './text-viewer-popup.js';
@@ -88,6 +89,9 @@ export async function openFrontendLogsPanel() {
 }
 
 export async function openBackendLogsPanel() {
+    if (isServerEnv()) {
+        throw new Error('Backend logs are not available in server mode.');
+    }
     const devApi = getDevApi();
     const initialEntries = await devApi.backendLogs.tail({ limit: 800 });
 
@@ -102,6 +106,9 @@ export async function openBackendLogsPanel() {
 }
 
 export async function openLlmApiLogsPanel() {
+    if (isServerEnv()) {
+        throw new Error('LLM API logs are not available in server mode.');
+    }
     const devApi = getDevApi();
     const keep = await devApi.llmApiLogs.getKeep();
     const indexEntries = await devApi.llmApiLogs.index({ limit: keep });

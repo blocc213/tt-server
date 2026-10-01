@@ -6,6 +6,7 @@ import {
     getChatBackupStorageStats,
     getRuntimePaths,
     getTauriTavernSettings,
+    isServerEnv,
 } from '../../../../tauri-bridge.js';
 import { getActiveIosPolicyCapabilities } from '../../../tauritavern/ios-policy.js';
 import {
@@ -21,15 +22,15 @@ export function isWindowsPlatform() {
 
 export function resolveTauriTavernSettingsCapabilities() {
     const iosCaps = getActiveIosPolicyCapabilities();
-    // Data directory selection is a desktop-only feature. Do not gate this on Bowser's `isMobile()`,
-    // because iPadOS may present a desktop-like user agent (e.g. platform "MacIntel").
-    const supportsDataRootSelection = !isAndroidRuntime() && !isIosRuntime();
+    // Data directory selection requires a native desktop host, not a desktop browser user agent.
+    const supportsDataRootSelection = !isServerEnv() && !isAndroidRuntime() && !isIosRuntime();
 
     return {
         requestProxyAllowed: iosCaps?.network?.request_proxy !== false,
-        lanSyncAllowed: iosCaps?.sync?.lan !== false,
-        supportsCloseToTrayOnClose: isWindowsPlatform() && !isMobile(),
+        lanSyncAllowed: !isServerEnv() && iosCaps?.sync?.lan !== false,
+        supportsCloseToTrayOnClose: !isServerEnv() && isWindowsPlatform() && !isMobile(),
         supportsDataRootSelection,
+        supportsNativeDevLogs: !isServerEnv(),
     };
 }
 

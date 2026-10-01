@@ -39,6 +39,9 @@ pub trait GroupChatRepository: Send + Sync {
     /// Get the absolute path to a group chat payload file.
     async fn get_group_chat_payload_path(&self, chat_id: &str) -> Result<PathBuf, DomainError>;
 
+    /// Get raw JSONL bytes for a group chat payload.
+    async fn get_group_chat_payload_bytes(&self, chat_id: &str) -> Result<Vec<u8>, DomainError>;
+
     /// Get the tail page for a group chat JSONL payload (excluding the header line).
     async fn get_group_chat_payload_tail_lines(
         &self,
