@@ -12,6 +12,26 @@ dist
 dist-ssr
 .cache
 *.local
+# Local secrets and mutable user data
+.env
+.env.*
+!.env.example
+data/
+docker-data/
+*.db
+*.sqlite
+*.sqlite3
+*.pem
+*.key
+*.p8
+*.p12
+*.pfx
+*.jks
+*.keystore
+*.mobileprovision
+credentials.json
+service-account*.json
+service_account*.json
 .playwright-mcp
 
 # Editor directories and files
