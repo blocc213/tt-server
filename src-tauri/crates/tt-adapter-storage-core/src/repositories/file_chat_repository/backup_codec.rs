@@ -1,4 +1,4 @@
-use std::io::{self, BufReader as StdBufReader, BufWriter, Write};
+use std::io::{self, BufWriter, Read, Write};
 use std::path::Path;
 use std::pin::Pin;
 use std::time::SystemTime;
@@ -7,6 +7,8 @@ use async_compression::tokio::bufread::ZstdDecoder;
 use tokio::fs;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader};
 use tt_domain::errors::DomainError;
+
+use crate::chat_jsonl::{RecordPrefix, is_whitespace};
 
 const ZSTD_COMPRESSION_LEVEL: i32 = 1;
 const ZSTD_FRAME_HEADER_MAX_SIZE: usize = 18;
@@ -44,6 +46,68 @@ impl BackupFormat {
 }
 
 pub(super) type DecodedBackupReader = Pin<Box<dyn AsyncRead + Send>>;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct BackupWriteStats {
+    pub stored_bytes: u64,
+    pub jsonl_record_count: usize,
+}
+
+#[derive(Default)]
+struct JsonlRecordCounter {
+    records: usize,
+    current_line_has_content: bool,
+    prefix: RecordPrefix,
+    preamble: [u8; 3],
+    preamble_len: usize,
+    preamble_complete: bool,
+}
+
+impl JsonlRecordCounter {
+    fn observe(&mut self, mut bytes: &[u8]) {
+        // Only the possible BOM needs lookahead; records are never buffered.
+        while !self.preamble_complete
+            && let Some((&byte, rest)) = bytes.split_first()
+        {
+            bytes = rest;
+            if self.preamble_len == 0 && is_whitespace(byte) {
+                continue;
+            }
+            self.preamble[self.preamble_len] = byte;
+            self.preamble_len += 1;
+            if self.preamble_len == self.preamble.len() || byte == b'\n' {
+                self.preamble_complete = !self
+                    .prefix
+                    .normalize(&self.preamble[..self.preamble_len])
+                    .is_empty();
+                if self.preamble_complete {
+                    let preamble = self.preamble;
+                    self.observe_records(&preamble[..self.preamble_len]);
+                }
+                self.preamble_len = 0;
+            }
+        }
+        self.observe_records(bytes);
+    }
+
+    fn observe_records(&mut self, bytes: &[u8]) {
+        for &byte in bytes {
+            if byte == b'\n' {
+                self.records += usize::from(self.current_line_has_content);
+                self.current_line_has_content = false;
+            } else if !is_whitespace(byte) {
+                self.current_line_has_content = true;
+            }
+        }
+    }
+
+    fn finish(self) -> usize {
+        // An incomplete prefix is still raw content; backup copying does not validate JSON.
+        self.records
+            + usize::from(self.current_line_has_content)
+            + usize::from(self.preamble_len > 0)
+    }
+}
 
 pub(super) async fn open_decoded_backup(
     path: &Path,
@@ -146,11 +210,40 @@ pub(super) async fn copy_decoded_backup_reader(
     result
 }
 
+pub(super) async fn copy_backup(
+    source_path: &Path,
+    target_path: &Path,
+    expected_source_len: u64,
+) -> Result<(std::fs::File, BackupWriteStats), DomainError> {
+    let source_path = source_path.to_path_buf();
+    let target_path = target_path.to_path_buf();
+    let task_target_path = target_path.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        copy_backup_blocking(&source_path, &task_target_path, expected_source_len)
+    })
+    .await
+    .map_err(|error| DomainError::InternalError(format!("Chat backup copy task failed: {error}")))
+    .and_then(|result| {
+        result.map_err(|error| {
+            DomainError::InternalError(format!(
+                "Failed to copy chat backup {}: {}",
+                target_path.display(),
+                error
+            ))
+        })
+    });
+
+    if result.is_err() {
+        let _ = fs::remove_file(&target_path).await;
+    }
+    result
+}
+
 pub(super) async fn compress_backup(
     source_path: &Path,
     target_path: &Path,
     expected_source_len: u64,
-) -> Result<u64, DomainError> {
+) -> Result<(std::fs::File, BackupWriteStats), DomainError> {
     let source_path = source_path.to_path_buf();
     let target_path = target_path.to_path_buf();
     let task_target_path = target_path.clone();
@@ -180,7 +273,7 @@ pub(super) async fn compress_backup(
 pub(super) async fn decompress_backup(
     source_path: &Path,
     target_path: &Path,
-) -> Result<u64, DomainError> {
+) -> Result<(std::fs::File, u64), DomainError> {
     let source_path = source_path.to_path_buf();
     let target_path = target_path.to_path_buf();
     let task_source_path = source_path.clone();
@@ -235,20 +328,19 @@ fn compress_backup_blocking(
     source_path: &Path,
     target_path: &Path,
     expected_source_len: u64,
-) -> io::Result<u64> {
-    let source = std::fs::File::open(source_path)?;
+) -> io::Result<(std::fs::File, BackupWriteStats)> {
+    let mut source = std::fs::File::open(source_path)?;
     let target = std::fs::OpenOptions::new()
         .create_new(true)
         .write(true)
         .open(target_path)?;
-    let mut source = StdBufReader::with_capacity(zstd::zstd_safe::CCtx::in_size(), source);
     let target = BufWriter::with_capacity(zstd::zstd_safe::CCtx::out_size(), target);
     let mut encoder = zstd::stream::write::Encoder::new(target, ZSTD_COMPRESSION_LEVEL)?;
     encoder.include_checksum(true)?;
     encoder.include_contentsize(true)?;
     encoder.set_pledged_src_size(Some(expected_source_len))?;
 
-    let copied = io::copy(&mut source, &mut encoder)?;
+    let (copied, jsonl_record_count) = copy_jsonl(&mut source, &mut encoder)?;
     if copied != expected_source_len {
         return Err(io::Error::new(
             io::ErrorKind::UnexpectedEof,
@@ -260,11 +352,63 @@ fn compress_backup_blocking(
 
     let mut target = encoder.finish()?;
     target.flush()?;
-    drop(target);
-    std::fs::metadata(target_path).map(|metadata| metadata.len())
+    let stats = BackupWriteStats {
+        stored_bytes: target.get_ref().metadata()?.len(),
+        jsonl_record_count,
+    };
+    Ok((target.into_inner()?, stats))
 }
 
-fn decompress_backup_blocking(source_path: &Path, target_path: &Path) -> io::Result<u64> {
+fn copy_backup_blocking(
+    source_path: &Path,
+    target_path: &Path,
+    expected_source_len: u64,
+) -> io::Result<(std::fs::File, BackupWriteStats)> {
+    let mut source = std::fs::File::open(source_path)?;
+    let target = std::fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(target_path)?;
+    let mut target = BufWriter::new(target);
+    let (copied, jsonl_record_count) = copy_jsonl(&mut source, &mut target)?;
+    if copied != expected_source_len {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            format!(
+                "chat backup source length changed: expected {expected_source_len}, copied {copied}"
+            ),
+        ));
+    }
+    target.flush()?;
+    let stats = BackupWriteStats {
+        stored_bytes: target.get_ref().metadata()?.len(),
+        jsonl_record_count,
+    };
+    Ok((target.into_inner()?, stats))
+}
+
+fn copy_jsonl(source: &mut impl Read, target: &mut impl Write) -> io::Result<(u64, usize)> {
+    let mut buffer = vec![0; zstd::zstd_safe::CCtx::in_size()];
+    let mut copied = 0u64;
+    let mut counter = JsonlRecordCounter::default();
+
+    loop {
+        let read = source.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        target.write_all(&buffer[..read])?;
+        counter.observe(&buffer[..read]);
+        copied += read as u64;
+    }
+
+    Ok((copied, counter.finish()))
+}
+
+fn decompress_backup_blocking(
+    source_path: &Path,
+    target_path: &Path,
+) -> io::Result<(std::fs::File, u64)> {
     let source = std::fs::File::open(source_path)?;
     let target = std::fs::OpenOptions::new()
         .create_new(true)
@@ -273,31 +417,8 @@ fn decompress_backup_blocking(source_path: &Path, target_path: &Path) -> io::Res
     let mut target = BufWriter::with_capacity(zstd::zstd_safe::DCtx::out_size(), target);
     zstd::stream::copy_decode(source, &mut target)?;
     target.flush()?;
-    drop(target);
-    std::fs::metadata(target_path).map(|metadata| metadata.len())
-}
-
-pub(super) fn materialization_file_name() -> String {
-    format!(
-        "backup-materialization-{}.jsonl",
-        uuid::Uuid::new_v4().simple()
-    )
-}
-
-pub(super) fn is_materialization_path(path: &Path, staging_dir: &Path) -> bool {
-    if path.parent() != Some(staging_dir) {
-        return false;
-    }
-    let Some(file_name) = path.file_name().and_then(|value| value.to_str()) else {
-        return false;
-    };
-    let Some(identifier) = file_name
-        .strip_prefix("backup-materialization-")
-        .and_then(|value| value.strip_suffix(".jsonl"))
-    else {
-        return false;
-    };
-    identifier.len() == 32 && uuid::Uuid::parse_str(identifier).is_ok()
+    let stored_bytes = target.get_ref().metadata()?.len();
+    Ok((target.into_inner()?, stored_bytes))
 }
 
 pub(super) fn restore_staging_file_name() -> String {
@@ -309,16 +430,25 @@ mod tests {
     use super::*;
 
     #[test]
-    fn backup_format_maps_logical_and_physical_names() {
-        let logical = "chat_alice_20260722-120000.jsonl";
-        assert_eq!(BackupFormat::RawJsonl.physical_file_name(logical), logical);
-        assert_eq!(
-            BackupFormat::Zstd.physical_file_name(logical),
-            format!("{logical}.zst")
-        );
-        assert_eq!(
-            BackupFormat::parse_physical_file_name(&format!("{logical}.zst")),
-            Some((BackupFormat::Zstd, logical.to_string()))
-        );
+    fn jsonl_copy_counts_non_empty_records_without_changing_bytes() {
+        struct ByteReads<'a>(&'a [u8]);
+        impl Read for ByteReads<'_> {
+            fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+                let len = buffer.len().min(1);
+                Read::read(&mut self.0, &mut buffer[..len])
+            }
+        }
+        for (payload, expected_count) in [
+            (b"\n\xef\xbb\xbf\n{}\r\n \t\n{\"mes\":1}".as_slice(), 2),
+            (b" \n\xef\xbb\xbf\n\t".as_slice(), 0),
+            (b"{}\n\xff\n{}".as_slice(), 3),
+        ] {
+            let mut copied = Vec::new();
+            let (byte_len, record_count) =
+                copy_jsonl(&mut ByteReads(payload), &mut copied).unwrap();
+            assert_eq!(byte_len, payload.len() as u64);
+            assert_eq!(record_count, expected_count);
+            assert_eq!(copied, payload);
+        }
     }
 }

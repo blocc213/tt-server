@@ -12,6 +12,7 @@ pub const DEFAULT_SKILL_READ_FALLBACK_MAX_CHARS: usize = 80_000;
 )]
 #[derive(Default)]
 pub enum SkillScope {
+    Builtin,
     #[default]
     Global,
     Preset {
@@ -29,6 +30,7 @@ pub enum SkillScope {
 impl SkillScope {
     pub fn stable_key(&self) -> String {
         match self {
+            Self::Builtin => "builtin".to_string(),
             Self::Global => "global".to_string(),
             Self::Preset { api_id, name } => format!("preset\0{api_id}\0{name}"),
             Self::Profile { profile_id } => format!("profile\0{profile_id}"),
@@ -38,6 +40,7 @@ impl SkillScope {
 
     pub fn label(&self) -> String {
         match self {
+            Self::Builtin => "builtin".to_string(),
             Self::Global => "global".to_string(),
             Self::Preset { api_id, name } => format!("preset:{api_id}:{name}"),
             Self::Profile { profile_id } => format!("profile:{profile_id}"),
@@ -54,6 +57,8 @@ impl SkillScope {
 )]
 #[derive(Default)]
 pub enum SkillScopeFilter {
+    Builtin,
+    // All means installed skills; management and embedded assets depend on it.
     All,
     #[default]
     Global,
@@ -72,7 +77,8 @@ pub enum SkillScopeFilter {
 impl SkillScopeFilter {
     pub fn matches(&self, scope: &SkillScope) -> bool {
         match self {
-            Self::All => true,
+            Self::Builtin => matches!(scope, SkillScope::Builtin),
+            Self::All => !matches!(scope, SkillScope::Builtin),
             Self::Global => matches!(scope, SkillScope::Global),
             Self::Preset { api_id, name } => matches!(
                 scope,
@@ -231,6 +237,8 @@ pub enum SkillImportInput {
     },
     ArchiveFile {
         path: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        skill_root: Option<String>,
         #[serde(default)]
         source: Value,
     },
@@ -270,10 +278,9 @@ pub struct SkillReadRequest {
     pub start_line: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub line_count: Option<usize>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub start_char: Option<usize>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub max_chars: Option<usize>,
+    /// Internal output budget. Agent and Host callers do not use it as a
+    /// character-range coordinate.
+    pub max_output_chars: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -299,54 +306,16 @@ pub struct SkillReadResult {
     pub words: usize,
     pub total_chars: usize,
     pub total_words: usize,
-    pub start_char: usize,
-    pub end_char: usize,
     pub total_lines: usize,
     pub start_line: usize,
     pub end_line: usize,
-    pub bytes: u64,
-    pub sha256: String,
-    pub truncated: bool,
-    pub resource_ref: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub struct SkillSearchRequest {
-    #[serde(default)]
-    pub scope: SkillScope,
-    pub name: String,
-    pub query: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub path: Option<String>,
-    pub limit: usize,
-    pub context_lines: usize,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
-pub struct SkillSearchHit {
-    pub path: String,
-    pub score: f32,
-    pub start_line: usize,
-    pub end_line: usize,
-    pub snippet: String,
+    pub next_start_line: Option<usize>,
+    pub line_truncated: bool,
     pub bytes: u64,
     pub sha256: String,
-    pub resource_ref: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
-pub struct SkillSearchResult {
-    pub scope: SkillScope,
-    pub name: String,
-    pub query: String,
-    pub hits: Vec<SkillSearchHit>,
-    pub searched_files: usize,
-    pub skipped_files: usize,
     pub truncated: bool,
-    pub returned_chars: usize,
+    pub resource_ref: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

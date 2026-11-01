@@ -7,16 +7,16 @@ use base64::Engine;
 use serde::Deserialize;
 use serde_json::{Map, Number, Value, json};
 use tokio::fs;
+use tokio::io::AsyncWriteExt;
 use tokio::sync::watch;
 use tokio::time::{Duration, sleep};
 use url::Url;
 
-use crate::endpoint_url::append_endpoint_path;
-use crate::file_replace::{replace_file_with_fallback, unique_temp_path};
 use crate::workers_ai_endpoint::workers_ai_run_url;
 use crate::workers_ai_models::{fetch_workers_ai_models, workers_ai_model_name};
 use tt_adapter_http::{HttpClientPool, HttpClientProfile};
 use tt_domain::errors::DomainError;
+use tt_domain::models::endpoint_url::append_endpoint_path;
 use tt_domain::models::filename::sanitize_filename;
 use tt_ports::repositories::stable_diffusion_repository::{
     SdRouteCredentials, SdRouteRequest, SdRouteResponse, SdRouteResponseKind,
@@ -865,7 +865,6 @@ async fn comfy_generate(
     let prompt = require_string(body, "prompt")?;
 
     let prompt_url = append_endpoint_path(&url, "prompt")?;
-    let history_url = append_endpoint_path(&url, "history")?;
     let interrupt_url = append_endpoint_path(&url, "interrupt")?;
 
     let client = http_client(http_clients)?;
@@ -900,6 +899,7 @@ async fn comfy_generate(
         .await
         .map_err(|error| DomainError::InternalError(error.to_string()))?;
     let id = prompt_json.prompt_id;
+    let history_url = append_endpoint_path(&url, &format!("history/{id}"))?;
 
     let item = loop {
         if *cancel.borrow() {
@@ -1133,11 +1133,38 @@ async fn comfy_save_workflow(dir: &Path, body: &Value) -> Result<SdRouteResponse
             .await
             .map_err(|error| DomainError::InternalError(error.to_string()))?;
     }
-    let temp_path = unique_temp_path(&dest);
-    fs::write(&temp_path, workflow.as_bytes())
+    let temp_path = dir.join(format!(
+        ".tauritavern-{}.tmp",
+        uuid::Uuid::new_v4().simple()
+    ));
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temp_path)
         .await
-        .map_err(|error| DomainError::InternalError(error.to_string()))?;
-    replace_file_with_fallback(&temp_path, &dest).await?;
+        .map_err(|error| {
+            DomainError::InternalError(format!(
+                "Failed to create workflow temp file {}: {error}",
+                temp_path.display()
+            ))
+        })?;
+    let result = async {
+        file.write_all(workflow.as_bytes()).await?;
+        file.flush().await?;
+        file.sync_all().await?;
+        drop(file);
+        fs::rename(&temp_path, &dest).await
+    }
+    .await;
+    if result.is_err() {
+        let _ = fs::remove_file(&temp_path).await;
+    }
+    result.map_err(|error| {
+        DomainError::InternalError(format!(
+            "Failed to save workflow {}: {error}",
+            dest.display()
+        ))
+    })?;
 
     let names = read_workflow_names(dir).await?;
     Ok(json_response(200, json!(names)))
@@ -1697,6 +1724,97 @@ async fn drawthings_generate(
 mod tests {
     use super::optional_nonnegative_number_value;
     use serde_json::json;
+
+    #[tokio::test]
+    async fn comfy_generation_queries_only_its_prompt_and_returns_the_image() {
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/comfy", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            for (target, body) in [
+                ("POST /comfy/prompt ", r#"{"prompt_id":"current"}"#),
+                (
+                    "GET /comfy/history/current ",
+                    r#"{"current":{"outputs":{"text":{"text":["ignored"]},"image":{"images":[{"filename":"current.png"}]}}}}"#,
+                ),
+                ("GET /comfy/view?filename=current.png&", "image-bytes"),
+            ] {
+                let (socket, _) = listener.accept().await.unwrap();
+                let mut socket = BufReader::new(socket);
+                let mut line = String::new();
+                socket.read_line(&mut line).await.unwrap();
+                assert!(line.starts_with(target), "Unexpected request: {line}");
+                let mut content_length = 0;
+                loop {
+                    line.clear();
+                    assert_ne!(socket.read_line(&mut line).await.unwrap(), 0);
+                    if line == "\r\n" {
+                        break;
+                    }
+                    if let Some(length) = line.to_ascii_lowercase().strip_prefix("content-length:")
+                    {
+                        content_length = length.trim().parse::<usize>().unwrap();
+                    }
+                }
+                socket
+                    .read_exact(&mut vec![0; content_length])
+                    .await
+                    .unwrap();
+                socket
+                    .get_mut()
+                    .write_all(
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        )
+                        .as_bytes(),
+                    )
+                    .await
+                    .unwrap();
+            }
+        });
+
+        let pool = super::Arc::new(super::HttpClientPool::new("TauriTavern/test"));
+        let (_cancel, cancel) = super::watch::channel(false);
+        let result = super::comfy_generate(&pool, &json!({ "url": url, "prompt": "{}" }), cancel)
+            .await
+            .unwrap();
+        server.await.unwrap();
+        assert_eq!(result.status, 200);
+        assert_eq!(
+            result.body,
+            json!({ "format": "png", "data": "aW1hZ2UtYnl0ZXM=" })
+        );
+    }
+
+    #[tokio::test]
+    async fn comfy_workflow_save_replaces_file_and_preserves_directory_on_failure() {
+        use std::io::Read;
+
+        let root =
+            std::env::temp_dir().join(format!("tauritavern-workflow-{}", uuid::Uuid::new_v4()));
+        let body = json!({ "file_name": "workflow.json", "workflow": "old" });
+        super::comfy_save_workflow(&root, &body).await.unwrap();
+        let target = root.join("workflow.json");
+        let mut old_file = std::fs::File::open(&target).unwrap();
+
+        let body = json!({ "file_name": "workflow.json", "workflow": "new" });
+        super::comfy_save_workflow(&root, &body).await.unwrap();
+        let mut old_contents = String::new();
+        old_file.read_to_string(&mut old_contents).unwrap();
+        assert_eq!(old_contents, "old");
+        assert_eq!(tokio::fs::read(&target).await.unwrap(), b"new");
+        drop(old_file);
+
+        tokio::fs::remove_file(&target).await.unwrap();
+        tokio::fs::create_dir(&target).await.unwrap();
+        super::comfy_save_workflow(&root, &body).await.unwrap_err();
+        assert!(target.is_dir());
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 1);
+        tokio::fs::remove_dir_all(root).await.unwrap();
+    }
 
     #[test]
     fn workers_ai_seed_omits_negative_values() {

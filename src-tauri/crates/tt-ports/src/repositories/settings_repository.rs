@@ -1,21 +1,22 @@
 use async_trait::async_trait;
-use serde::{Deserialize, Serialize};
+use tt_contracts::byte_commit::CommitBegin;
 use tt_domain::errors::DomainError;
+use tt_domain::models::persona::Personas;
+use tt_domain::models::settings::revision::UserSettingsRevision;
 use tt_domain::models::settings::{SettingsSnapshot, TauriTavernSettings, UserSettings};
+
+pub struct SettingsCommitResult {
+    pub revision: UserSettingsRevision,
+    pub personas: Personas,
+}
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct SettingsAggregateSignature(String);
 
 impl SettingsAggregateSignature {
-    pub fn from_revision(revision: impl Into<String>) -> Self {
-        Self(revision.into())
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
     }
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub struct UserSettingsRevision {
-    pub hash_algorithm: String,
-    pub settings_hash: String,
 }
 
 #[async_trait]
@@ -26,20 +27,29 @@ pub trait SettingsRepository: Send + Sync {
     ) -> Result<(), DomainError>;
     async fn load_tauritavern_settings(&self) -> Result<TauriTavernSettings, DomainError>;
 
-    async fn save_user_settings(&self, settings: &UserSettings) -> Result<(), DomainError>;
+    async fn save_user_settings(&self, settings: UserSettings) -> Result<(), DomainError>;
     async fn load_user_settings(&self) -> Result<UserSettings, DomainError>;
-    async fn load_user_settings_revision(
-        &self,
-    ) -> Result<Option<UserSettingsRevision>, DomainError>;
-    async fn save_user_settings_revision(
-        &self,
-        revision: &UserSettingsRevision,
-    ) -> Result<(), DomainError>;
 
-    async fn create_snapshot(&self) -> Result<(), DomainError>;
+    async fn begin_commit(
+        &self,
+        expected: Option<UserSettingsRevision>,
+    ) -> Result<CommitBegin, DomainError>;
+    async fn append_commit(
+        &self,
+        session_id: &str,
+        offset: u64,
+        bytes: &[u8],
+    ) -> Result<u64, DomainError>;
+    async fn finish_commit(
+        &self,
+        session_id: &str,
+        expected_size: u64,
+    ) -> Result<SettingsCommitResult, DomainError>;
+    async fn abort_commit(&self, session_id: &str) -> Result<(), DomainError>;
+
+    async fn create_snapshot(&self, settings: UserSettings) -> Result<(), DomainError>;
     async fn get_snapshots(&self) -> Result<Vec<SettingsSnapshot>, DomainError>;
     async fn load_snapshot(&self, name: &str) -> Result<UserSettings, DomainError>;
-    async fn restore_snapshot(&self, name: &str) -> Result<(), DomainError>;
 
     async fn get_sillytavern_settings_signature(
         &self,

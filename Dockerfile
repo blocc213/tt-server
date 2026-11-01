@@ -11,12 +11,13 @@ ENV PNPM_HOME=/pnpm \
     PATH=/pnpm:$PATH
 
 WORKDIR /build
-RUN corepack enable && corepack prepare pnpm@10.33.3 --activate
+RUN corepack enable && corepack prepare pnpm@11.22.0 --activate
 
 COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
+COPY packages ./packages
 RUN pnpm install --frozen-lockfile
 
-COPY rspack.config.js tsconfig.host.json ./
+COPY rspack.config.js tsconfig.host.json tsconfig.ui.json ./
 COPY scripts ./scripts
 COPY src ./src
 RUN pnpm run web:build

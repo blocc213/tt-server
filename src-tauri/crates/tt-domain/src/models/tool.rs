@@ -4,12 +4,19 @@ use std::{
 };
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
-use serde_json::Value;
+use serde_json::{Map, Value};
 
 use crate::errors::DomainError;
 
 const TOOL_ID_SEPARATOR: char = ':';
 const BUILTIN_TOOL_PROVIDER_ID: &str = "builtin";
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum AgentToolScope {
+    Chat,
+    Session,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct ToolProviderId(String);
@@ -118,6 +125,24 @@ impl ToolId {
         self.provider_id() == BUILTIN_TOOL_PROVIDER_ID
     }
 
+    pub fn extension(extension_id: &str, name: &str) -> Result<Self, DomainError> {
+        if extension_id.trim().is_empty() || name.trim().is_empty() {
+            return Err(DomainError::InvalidData(
+                "extension.tool_identity_required: extensionId and name are required".into(),
+            ));
+        }
+        Self::new(
+            &ToolProviderId::parse(format!("extension/{extension_id}"))?,
+            name,
+        )
+    }
+
+    pub fn extension_id(&self) -> Option<&str> {
+        self.provider_id()
+            .strip_prefix("extension/")
+            .filter(|id| !id.trim().is_empty())
+    }
+
     pub fn as_str(&self) -> &str {
         &self.0
     }
@@ -147,7 +172,7 @@ impl<'de> Deserialize<'de> for ToolId {
     }
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct ToolDescriptor {
     pub id: ToolId,
@@ -156,6 +181,73 @@ pub struct ToolDescriptor {
     pub input_schema: Value,
     pub output_schema: Option<Value>,
     pub annotations: Value,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ToolDescriptionOverride {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub properties: BTreeMap<String, String>,
+}
+
+impl ToolDescriptionOverride {
+    pub fn is_empty(&self) -> bool {
+        self.description.is_none() && self.properties.is_empty()
+    }
+}
+
+impl ToolDescriptor {
+    pub fn set_property_description(
+        &mut self,
+        property: &str,
+        description: &str,
+    ) -> Result<(), DomainError> {
+        let properties = self
+            .input_schema
+            .get_mut("properties")
+            .and_then(Value::as_object_mut)
+            .ok_or_else(|| {
+                DomainError::InvalidData(format!(
+                    "tool.description_override_properties_invalid: `{}` has no object properties",
+                    self.id
+                ))
+            })?;
+        let schema = properties.get_mut(property).ok_or_else(|| {
+            DomainError::InvalidData(format!(
+                "tool.description_override_unknown_property: `{}` has no property `{property}`",
+                self.id
+            ))
+        })?;
+        let object = schema.as_object_mut().ok_or_else(|| {
+            DomainError::InvalidData(format!(
+                "tool.description_override_property_schema_invalid: `{}` property `{property}` is not an object",
+                self.id
+            ))
+        })?;
+        object.insert(
+            "description".to_string(),
+            Value::String(description.to_string()),
+        );
+        Ok(())
+    }
+
+    pub fn apply_description_override(
+        &mut self,
+        override_: &ToolDescriptionOverride,
+    ) -> Result<(), DomainError> {
+        if let Some(description) = override_.description.as_ref() {
+            self.description = Some(description.clone());
+        }
+        if override_.properties.is_empty() {
+            return Ok(());
+        }
+        for (property, description) in &override_.properties {
+            self.set_property_description(property, description)?;
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq, Hash)]
@@ -183,20 +275,26 @@ impl fmt::Display for ToolSnapshotId {
     }
 }
 
+impl<'de> Deserialize<'de> for ToolSnapshotId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Self::parse(String::deserialize(deserializer)?).map_err(de::Error::custom)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct ToolBinding {
     descriptor: ToolDescriptor,
     model_alias: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    max_calls: Option<usize>,
 }
 
 impl ToolBinding {
     pub fn new(
         descriptor: ToolDescriptor,
         model_alias: impl Into<String>,
-        max_calls: Option<usize>,
     ) -> Result<Self, DomainError> {
         let model_alias = model_alias.into();
         if model_alias.is_empty() {
@@ -205,16 +303,9 @@ impl ToolBinding {
                 descriptor.id
             )));
         }
-        if max_calls == Some(0) {
-            return Err(DomainError::InvalidData(format!(
-                "tool.snapshot_tool_budget_invalid: tool `{}` max calls must be greater than zero",
-                descriptor.id
-            )));
-        }
         Ok(Self {
             descriptor,
             model_alias,
-            max_calls,
         })
     }
 
@@ -229,9 +320,22 @@ impl ToolBinding {
     pub fn model_alias(&self) -> &str {
         &self.model_alias
     }
+}
 
-    pub fn max_calls(&self) -> Option<usize> {
-        self.max_calls
+impl<'de> Deserialize<'de> for ToolBinding {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase", deny_unknown_fields)]
+        struct Binding {
+            descriptor: ToolDescriptor,
+            model_alias: String,
+        }
+
+        let binding = Binding::deserialize(deserializer)?;
+        Self::new(binding.descriptor, binding.model_alias).map_err(de::Error::custom)
     }
 }
 
@@ -241,24 +345,12 @@ pub struct InvocationToolSnapshot {
     schema_version: u32,
     id: ToolSnapshotId,
     bindings: Vec<ToolBinding>,
-    max_calls_per_invocation: usize,
 }
 
 impl InvocationToolSnapshot {
     pub const SCHEMA_VERSION: u32 = 1;
 
-    pub fn try_new(
-        id: ToolSnapshotId,
-        bindings: Vec<ToolBinding>,
-        max_calls_per_invocation: usize,
-    ) -> Result<Self, DomainError> {
-        if max_calls_per_invocation == 0 {
-            return Err(DomainError::InvalidData(
-                "tool.snapshot_budget_invalid: max calls per invocation must be greater than zero"
-                    .to_string(),
-            ));
-        }
-
+    pub fn try_new(id: ToolSnapshotId, bindings: Vec<ToolBinding>) -> Result<Self, DomainError> {
         let mut tool_ids = HashSet::with_capacity(bindings.len());
         let mut aliases = HashSet::with_capacity(bindings.len());
         for binding in &bindings {
@@ -280,7 +372,6 @@ impl InvocationToolSnapshot {
             schema_version: Self::SCHEMA_VERSION,
             id,
             bindings,
-            max_calls_per_invocation,
         })
     }
 
@@ -292,16 +383,36 @@ impl InvocationToolSnapshot {
         &self.bindings
     }
 
-    pub fn max_calls_per_invocation(&self) -> usize {
-        self.max_calls_per_invocation
-    }
-
     pub fn binding(&self, tool_id: &ToolId) -> Option<&ToolBinding> {
-        // ponytail: invocation tool surfaces are small; add a derived index only if profiling
+        // Invocation tool surfaces are small; add a derived index only if profiling
         // shows linear lookup matters.
         self.bindings
             .iter()
             .find(|binding| binding.tool_id() == tool_id)
+    }
+}
+
+impl<'de> Deserialize<'de> for InvocationToolSnapshot {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase", deny_unknown_fields)]
+        struct Snapshot {
+            schema_version: u32,
+            id: ToolSnapshotId,
+            bindings: Vec<ToolBinding>,
+        }
+
+        let snapshot = Snapshot::deserialize(deserializer)?;
+        if snapshot.schema_version != Self::SCHEMA_VERSION {
+            return Err(de::Error::custom(format!(
+                "tool.snapshot_schema_unsupported: unsupported tool snapshot version {}",
+                snapshot.schema_version
+            )));
+        }
+        Self::try_new(snapshot.id, snapshot.bindings).map_err(de::Error::custom)
     }
 }
 
@@ -360,12 +471,93 @@ pub enum ToolChoice {
     Specific(ToolId),
 }
 
+const INVALID_ARGUMENTS_QUOTE_CHARS: usize = 200;
+
+/// Invalid arguments retain their raw text in storage but replay as `{}`.
+/// The paired tool error carries the rejection back to the model.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ToolArguments {
+    Object(Map<String, Value>),
+    Invalid(String),
+}
+
+impl ToolArguments {
+    pub fn empty() -> Self {
+        Self::Object(Map::new())
+    }
+
+    pub fn decode(raw: Option<&Value>) -> Self {
+        match raw {
+            None | Some(Value::Null) => Self::empty(),
+            Some(Value::String(text)) if text.trim().is_empty() => Self::empty(),
+            Some(Value::String(text)) => match serde_json::from_str::<Value>(text) {
+                Ok(Value::Object(map)) => Self::Object(map),
+                Ok(Value::Null) => Self::empty(),
+                _ => Self::Invalid(text.clone()),
+            },
+            Some(Value::Object(map)) => Self::Object(map.clone()),
+            Some(value) => Self::Invalid(value.to_string()),
+        }
+    }
+
+    pub fn as_map(&self) -> Result<&Map<String, Value>, String> {
+        match self {
+            Self::Object(map) => Ok(map),
+            Self::Invalid(raw) => Err(format!(
+                "arguments must be a JSON object; send `{{}}` when the call takes no arguments. Received: `{}`",
+                quote_invalid_arguments(raw)
+            )),
+        }
+    }
+
+    pub fn encode_for_replay(&self) -> String {
+        match self {
+            Self::Object(map) => {
+                serde_json::to_string(map).expect("JSON argument objects are serializable")
+            }
+            Self::Invalid(_) => "{}".to_string(),
+        }
+    }
+
+    pub fn to_replay_object(&self) -> Value {
+        match self {
+            Self::Object(map) => Value::Object(map.clone()),
+            Self::Invalid(_) => Value::Object(Map::new()),
+        }
+    }
+}
+
+impl Serialize for ToolArguments {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::Object(map) => map.serialize(serializer),
+            Self::Invalid(raw) => serializer.serialize_str(raw),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for ToolArguments {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Ok(match Value::deserialize(deserializer)? {
+            Value::Object(map) => Self::Object(map),
+            value => Self::decode(Some(&value)),
+        })
+    }
+}
+
+fn quote_invalid_arguments(raw: &str) -> String {
+    match raw.char_indices().nth(INVALID_ARGUMENTS_QUOTE_CHARS) {
+        Some((index, _)) => format!("{}…", &raw[..index]),
+        None => raw.to_string(),
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct ToolInvocation {
     pub call_id: String,
     pub tool_id: ToolId,
-    pub arguments: Value,
+    pub arguments: ToolArguments,
     #[serde(default)]
     pub provider_metadata: Value,
 }
@@ -386,6 +578,22 @@ impl ToolTurnContract {
             .map(|binding| binding.tool_id().clone())
             .collect::<Vec<_>>();
 
+        Self::from_tools(snapshot.id().clone(), tools, choice)
+    }
+
+    fn from_tools(
+        snapshot_id: ToolSnapshotId,
+        tools: Vec<ToolId>,
+        choice: ToolChoice,
+    ) -> Result<Self, DomainError> {
+        let mut unique = HashSet::with_capacity(tools.len());
+        for tool_id in &tools {
+            if !unique.insert(tool_id) {
+                return Err(DomainError::InvalidData(format!(
+                    "tool.turn_duplicate_id: duplicate tool id `{tool_id}`"
+                )));
+            }
+        }
         if matches!(choice, ToolChoice::Required) && tools.is_empty() {
             return Err(DomainError::InvalidData(
                 "tool.turn_required_empty: required tool choice needs at least one tool"
@@ -393,16 +601,15 @@ impl ToolTurnContract {
             ));
         }
         if let ToolChoice::Specific(tool_id) = &choice
-            && snapshot.binding(tool_id).is_none()
+            && !tools.contains(tool_id)
         {
             return Err(DomainError::InvalidData(format!(
-                "tool.turn_specific_not_available: specific tool `{tool_id}` is not available in snapshot `{}`",
-                snapshot.id()
+                "tool.turn_specific_not_available: specific tool `{tool_id}` is not available in snapshot `{snapshot_id}`"
             )));
         }
 
         Ok(Self {
-            snapshot_id: snapshot.id().clone(),
+            snapshot_id,
             tools,
             choice,
         })
@@ -421,13 +628,34 @@ impl ToolTurnContract {
     }
 }
 
+impl<'de> Deserialize<'de> for ToolTurnContract {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase", deny_unknown_fields)]
+        struct Turn {
+            snapshot_id: ToolSnapshotId,
+            tools: Vec<ToolId>,
+            choice: ToolChoice,
+        }
+
+        let turn = Turn::deserialize(deserializer)?;
+        Self::from_tools(turn.snapshot_id, turn.tools, turn.choice).map_err(de::Error::custom)
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use serde_json::json;
 
     use super::{
-        InvocationToolSnapshot, ToolBinding, ToolCatalog, ToolChoice, ToolDescriptor, ToolId,
-        ToolProviderId, ToolSnapshotId, ToolTurnContract,
+        InvocationToolSnapshot, ToolArguments, ToolBinding, ToolCatalog, ToolChoice,
+        ToolDescriptionOverride, ToolDescriptor, ToolId, ToolProviderId, ToolSnapshotId,
+        ToolTurnContract,
     };
     use crate::errors::DomainError;
 
@@ -443,19 +671,6 @@ mod tests {
     }
 
     #[test]
-    fn tool_identity_is_stable_and_opaque() {
-        let builtin = ToolProviderId::builtin();
-        let mcp = ToolProviderId::parse("mcp/registration-1").unwrap();
-        let builtin_id = ToolId::new(&builtin, "workspace.read_file").unwrap();
-        let mcp_id = ToolId::new(&mcp, "workspace.read_file").unwrap();
-
-        assert_eq!(builtin_id.as_str(), "builtin:workspace.read_file");
-        assert_eq!(builtin_id.provider_id(), "builtin");
-        assert_eq!(builtin_id.native_name(), "workspace.read_file");
-        assert_ne!(builtin_id, mcp_id);
-    }
-
-    #[test]
     fn tool_identity_rejects_invalid_serialized_values() {
         for invalid in ["", "builtin", ":tool", "builtin:"] {
             assert!(serde_json::from_value::<ToolId>(json!(invalid)).is_err());
@@ -464,37 +679,57 @@ mod tests {
     }
 
     #[test]
-    fn tool_choice_uses_canonical_domain_shape() {
-        let choice = ToolChoice::Specific(ToolId::builtin("workspace.finish").unwrap());
-        let value = serde_json::to_value(&choice).unwrap();
+    fn description_override_only_changes_model_facing_text() {
+        let mut descriptor = ToolDescriptor {
+            id: ToolId::builtin("search").unwrap(),
+            title: Some("Search".to_string()),
+            description: Some("Server description".to_string()),
+            input_schema: json!({
+                "type": "object",
+                "properties": { "query": { "type": "string" } },
+                "required": ["query"]
+            }),
+            output_schema: None,
+            annotations: json!({ "readOnlyHint": true }),
+        };
+        descriptor
+            .apply_description_override(&ToolDescriptionOverride {
+                description: Some("  Custom description  ".to_string()),
+                properties: BTreeMap::from([("query".to_string(), "  Custom query  ".to_string())]),
+            })
+            .unwrap();
 
-        assert_eq!(value, json!({ "specific": "builtin:workspace.finish" }));
-        assert_eq!(serde_json::from_value::<ToolChoice>(value).unwrap(), choice);
+        assert_eq!(
+            descriptor.description.as_deref(),
+            Some("  Custom description  ")
+        );
+        assert_eq!(
+            descriptor.input_schema["properties"]["query"]["description"],
+            "  Custom query  "
+        );
+        assert_eq!(
+            descriptor.input_schema["properties"]["query"]["type"],
+            "string"
+        );
+        assert_eq!(descriptor.input_schema["required"], json!(["query"]));
     }
 
     #[test]
     fn snapshot_preserves_binding_order_and_rejects_duplicate_aliases() {
-        let first = ToolBinding::new(
-            descriptor(ToolId::builtin("first").unwrap()),
-            "first_alias",
-            Some(2),
-        )
-        .unwrap();
+        let first =
+            ToolBinding::new(descriptor(ToolId::builtin("first").unwrap()), "first_alias").unwrap();
         let second = ToolBinding::new(
             descriptor(ToolId::builtin("second").unwrap()),
             "second_alias",
-            None,
         )
         .unwrap();
         let snapshot = InvocationToolSnapshot::try_new(
             ToolSnapshotId::parse("inv_root").unwrap(),
             vec![second.clone(), first.clone()],
-            4,
         )
         .unwrap();
 
         assert_eq!(snapshot.bindings(), &[second, first.clone()]);
-        assert_eq!(snapshot.max_calls_per_invocation(), 4);
         assert_eq!(
             serde_json::to_value(&snapshot).unwrap()["bindings"][0]["modelAlias"],
             "second_alias"
@@ -503,13 +738,11 @@ mod tests {
         let duplicate = ToolBinding::new(
             descriptor(ToolId::builtin("third").unwrap()),
             "second_alias",
-            None,
         )
         .unwrap();
         let error = InvocationToolSnapshot::try_new(
             ToolSnapshotId::parse("duplicate").unwrap(),
             vec![snapshot.bindings()[0].clone(), duplicate],
-            4,
         )
         .unwrap_err();
         assert!(
@@ -519,12 +752,43 @@ mod tests {
         let error = InvocationToolSnapshot::try_new(
             ToolSnapshotId::parse("duplicate-id").unwrap(),
             vec![first.clone(), first],
-            4,
         )
         .unwrap_err();
         assert!(
             matches!(error, DomainError::Conflict(message) if message.contains("tool.snapshot_duplicate_id"))
         );
+    }
+
+    #[test]
+    fn snapshot_restore_preserves_policy_and_rejects_invalid_bindings() {
+        let snapshot = InvocationToolSnapshot::try_new(
+            ToolSnapshotId::parse("inv_root").unwrap(),
+            vec![
+                ToolBinding::new(descriptor(ToolId::builtin("read").unwrap()), "read").unwrap(),
+                ToolBinding::new(descriptor(ToolId::builtin("write").unwrap()), "write").unwrap(),
+            ],
+        )
+        .unwrap();
+        let serialized = serde_json::to_value(&snapshot).unwrap();
+        assert_eq!(
+            serde_json::from_value::<InvocationToolSnapshot>(serialized.clone()).unwrap(),
+            snapshot
+        );
+
+        for (path, value) in [
+            ("/schemaVersion", json!(2)),
+            ("/id", json!("")),
+            ("/bindings/0/modelAlias", json!("")),
+            ("/bindings/1/modelAlias", json!("read")),
+            ("/bindings/1/descriptor/id", json!("builtin:read")),
+        ] {
+            let mut invalid = serialized.clone();
+            *invalid.pointer_mut(path).unwrap() = value;
+            assert!(
+                serde_json::from_value::<InvocationToolSnapshot>(invalid).is_err(),
+                "accepted invalid snapshot field {path}"
+            );
+        }
     }
 
     #[test]
@@ -534,50 +798,67 @@ mod tests {
         let snapshot = InvocationToolSnapshot::try_new(
             ToolSnapshotId::parse("inv_root").unwrap(),
             vec![
-                ToolBinding::new(descriptor(first_id.clone()), "first", None).unwrap(),
-                ToolBinding::new(descriptor(second_id.clone()), "second", None).unwrap(),
+                ToolBinding::new(descriptor(first_id.clone()), "first").unwrap(),
+                ToolBinding::new(descriptor(second_id.clone()), "second").unwrap(),
             ],
-            4,
         )
         .unwrap();
 
         let expected = vec![first_id, second_id.clone()];
         let turn = ToolTurnContract::all(&snapshot, ToolChoice::Specific(second_id)).unwrap();
         assert_eq!(turn.tools(), expected.as_slice());
+        let serialized = serde_json::to_value(&turn).unwrap();
+        assert_eq!(
+            serde_json::from_value::<ToolTurnContract>(serialized.clone()).unwrap(),
+            turn
+        );
+        for tools in [json!([]), json!(["builtin:first", "builtin:first"])] {
+            let mut invalid = serialized.clone();
+            invalid["tools"] = tools;
+            assert!(serde_json::from_value::<ToolTurnContract>(invalid).is_err());
+        }
 
         let unknown = ToolId::builtin("unknown").unwrap();
         assert!(ToolTurnContract::all(&snapshot, ToolChoice::Specific(unknown)).is_err());
 
         let empty =
-            InvocationToolSnapshot::try_new(ToolSnapshotId::parse("empty").unwrap(), Vec::new(), 4)
+            InvocationToolSnapshot::try_new(ToolSnapshotId::parse("empty").unwrap(), Vec::new())
                 .unwrap();
         assert!(ToolTurnContract::all(&empty, ToolChoice::Required).is_err());
     }
 
     #[test]
-    fn tool_catalog_orders_by_id_and_keeps_provider_namespaces_distinct() {
-        let builtin_id = ToolId::builtin("search").unwrap();
-        let mcp_id = ToolId::new(
-            &ToolProviderId::parse("mcp/registration-1").unwrap(),
-            "search",
-        )
-        .unwrap();
-        let catalog = ToolCatalog::try_from_descriptors([
-            descriptor(mcp_id.clone()),
-            descriptor(builtin_id.clone()),
-        ])
-        .unwrap();
+    fn both_wire_encodings_of_a_value_decode_to_the_same_arguments() {
+        let object = ToolArguments::decode(Some(&json!({ "depth": 2 })));
+        for (raw, expected) in [
+            (None, ToolArguments::empty()),
+            (Some(json!(null)), ToolArguments::empty()),
+            (Some(json!("null")), ToolArguments::empty()),
+            (Some(json!("  ")), ToolArguments::empty()),
+            (Some(json!("{}")), ToolArguments::empty()),
+            (Some(json!(r#"{"depth":2}"#)), object.clone()),
+            (Some(json!([1, 2])), ToolArguments::Invalid("[1,2]".into())),
+            (Some(json!("[1,2]")), ToolArguments::Invalid("[1,2]".into())),
+            (
+                Some(json!(r#"{"path":"#)),
+                ToolArguments::Invalid(r#"{"path":"#.into()),
+            ),
+        ] {
+            assert_eq!(ToolArguments::decode(raw.as_ref()), expected, "{raw:?}");
+        }
+    }
 
-        assert_eq!(catalog.len(), 2);
-        assert!(!catalog.is_empty());
-        assert_eq!(catalog.get(&builtin_id).unwrap().id, builtin_id);
+    #[test]
+    fn invalid_arguments_are_stored_verbatim_but_replay_as_an_empty_object() {
+        let invalid = ToolArguments::decode(Some(&json!("x".repeat(500))));
+
         assert_eq!(
-            catalog
-                .iter()
-                .map(|descriptor| descriptor.id.as_str())
-                .collect::<Vec<_>>(),
-            ["builtin:search", "mcp/registration-1:search"]
+            serde_json::to_value(&invalid).unwrap(),
+            json!("x".repeat(500))
         );
+        assert_eq!(invalid.encode_for_replay(), "{}");
+        let message = invalid.as_map().unwrap_err();
+        assert!(message.contains('…') && message.len() < 400, "{message}");
     }
 
     #[test]
@@ -593,13 +874,5 @@ mod tests {
                 if message
                     == "tool.catalog_duplicate_id: duplicate tool id `builtin:workspace.finish`"
         ));
-    }
-
-    #[test]
-    fn tool_catalog_can_be_empty() {
-        let catalog = ToolCatalog::try_from_descriptors(Vec::new()).unwrap();
-
-        assert!(catalog.is_empty());
-        assert_eq!(catalog.iter().count(), 0);
     }
 }

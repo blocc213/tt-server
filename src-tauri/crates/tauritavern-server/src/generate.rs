@@ -81,6 +81,7 @@ pub async fn status(
     Json(payload): Json<Value>,
 ) -> Result<Json<Value>, ServerError> {
     let dto = serde_json::from_value(payload)?;
+    crate::rpc_services::ensure_endpoint(&state,state.services.chat_completion_service.resolve_status_user_endpoint(&dto)?).await?;
     Ok(Json(
         state
             .services
@@ -92,30 +93,58 @@ pub async fn status(
 
 pub async fn generate(
     State(state): State<SharedState>,
-    Json(request): Json<GenerateRequest>,
+    axum::Extension(owner): axum::Extension<crate::browser_resources::RequestOwner>,
+    Json(mut request): Json<GenerateRequest>,
 ) -> Result<Response, ServerError> {
-    let payload = request.payload;
+    if let Some(id)=request.stream_id.as_mut() { validate_stream_id(id)?; *id=scoped_stream_id(&owner.0,id); }
+    let payload = &request.payload;
+    log_failed_request(generate_inner(state, &request).await, Some(payload))
+}
+
+fn log_failed_request<T, E>(outcome: Result<T, E>, payload: Option<&Value>) -> Result<T, E> {
+    if outcome.is_err()
+        && tracing::enabled!(target: "tauritavern_server::llm", tracing::Level::INFO)
+        && let Some(payload) = payload
+    {
+        tracing::info!(target: "tauritavern_server::llm",
+            "Chat Completion failed browser request:\n{}", crate::llm_logging::pretty(payload, None));
+    }
+    outcome
+}
+
+async fn generate_inner(
+    state: SharedState,
+    request: &GenerateRequest,
+) -> Result<Response, ServerError> {
+    let payload = &request.payload;
+    let dto = serde::Deserialize::deserialize(payload)?;
+    crate::rpc_services::ensure_endpoint(&state,state.services.chat_completion_service.resolve_generate_user_endpoint(&dto)?).await?;
 
     if request.background {
-        let id = request.stream_id.ok_or_else(|| {
+        let id = request.stream_id.clone().ok_or_else(|| {
             ServerError::BadRequest("Background generation needs a stream id".into())
         })?;
         validate_stream_id(&id)?;
-        let stream = wants_stream(&payload);
+        let stream = wants_stream(payload);
         let (job, created) = crate::background::get_or_insert(&id, stream);
+        tracing::info!(stream_id = %id, stream, created, "Background job accepted");
         if created {
-            let dto = serde_json::from_value(payload)?;
+            let dto = serde::Deserialize::deserialize(payload)?;
             spawn_background(
                 state.services.chat_completion_service.clone(),
                 id,
                 job.clone(),
                 dto,
+                tracing::enabled!(target: "tauritavern_server::llm", tracing::Level::INFO)
+                    .then(|| payload.clone()),
             );
+        } else {
+            tracing::info!(stream_id = %id, "Background job re-attached");
         }
         return Ok(background_response(&job, 0).await);
     }
 
-    if !wants_stream(&payload) {
+    if !wants_stream(payload) {
         // Registered even without streaming so Stop can abort a slow
         // non-streaming call instead of leaving it running upstream.
         let request_id = request
@@ -125,24 +154,23 @@ pub async fn generate(
         validate_stream_id(&request_id)?;
 
         let service = state.services.chat_completion_service.clone();
-        let dto = serde_json::from_value(payload)?;
-        let cancel = service.register_generation(&request_id).await;
-        let completion = service.generate_with_cancel(dto, cancel).await;
-        service.complete_generation(&request_id).await;
+        let dto = serde::Deserialize::deserialize(payload)?;
+        let completion = service.generate_request(&request_id, dto).await;
 
         return Ok(Json(completion?).into_response());
     }
 
     let stream_id = request
         .stream_id
+        .clone()
         .unwrap_or_else(|| format!("stream-{}", uuid_like()));
     validate_stream_id(&stream_id)?;
 
     let service = state.services.chat_completion_service.clone();
-    let dto = serde_json::from_value(payload)?;
-    let cancel = service.register_stream(&stream_id).await;
-
-    let (sender, receiver) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let dto = serde::Deserialize::deserialize(payload)?;
+    let log_payload = tracing::enabled!(target: "tauritavern_server::llm", tracing::Level::INFO)
+        .then(|| payload.clone());
+    service.start_stream(stream_id.clone(), dto).await?;
     let (event_tx, event_rx) = tokio::sync::mpsc::unbounded_channel::<Result<Event, Infallible>>();
 
     // Provider stream -> SSE frames. Ends on provider completion, provider
@@ -150,44 +178,14 @@ pub async fn generate(
     let generation_service = service.clone();
     let generation_stream_id = stream_id.clone();
     tokio::spawn(async move {
-        let mut chunks = UnboundedReceiverStream::new(receiver);
-        let forward = {
-            let event_tx = event_tx.clone();
-            tokio::spawn(async move {
-                use futures_util::StreamExt as _;
-                while let Some(chunk) = chunks.next().await {
-                    if chunk.is_empty() {
-                        continue;
-                    }
-                    // Sending fails once the browser is gone; stop pumping.
-                    if event_tx.send(Ok(Event::default().data(chunk))).is_err() {
-                        break;
-                    }
-                }
-            })
-        };
-
-        let outcome = generation_service
-            .generate_stream(dto, sender, cancel)
-            .await;
-        let _ = forward.await;
-
-        match outcome {
-            Ok(()) => {
-                let _ = event_tx.send(Ok(Event::default().data("[DONE]")));
-            }
-            Err(error) => {
-                let message = error.to_string();
-                tracing::warn!(stream_id = %generation_stream_id, %message, "Chat completion stream ended with an error");
-                let payload = json!({ "error": { "message": message } });
-                let _ = event_tx.send(Ok(Event::default().data(payload.to_string())));
-                let _ = event_tx.send(Ok(Event::default().data("[DONE]")));
-            }
+        let outcome = forward_stream(&generation_service, &generation_stream_id, |chunk| {
+            event_tx.send(Ok(Event::default().data(chunk))).is_ok()
+        }).await;
+        if let Err(error) = log_failed_request(outcome, log_payload.as_ref()) {
+            let _ = event_tx.send(Ok(Event::default().data(json!({"error":{"message":error.to_string()}}).to_string())));
+            let _ = event_tx.send(Ok(Event::default().data("[DONE]")));
         }
-
-        generation_service
-            .complete_stream(&generation_stream_id)
-            .await;
+        generation_service.close_stream(&generation_stream_id).await;
     });
 
     // Dropping the response body means the browser is gone: tab closed, network
@@ -212,13 +210,15 @@ pub async fn generate(
 /// connection to the provider.
 pub async fn cancel_stream(
     State(state): State<SharedState>,
-    Json(request): Json<CancelRequest>,
+    axum::Extension(owner): axum::Extension<crate::browser_resources::RequestOwner>,
+    Json(mut request): Json<CancelRequest>,
 ) -> Result<Json<Value>, ServerError> {
     validate_stream_id(&request.stream_id)?;
+    request.stream_id=scoped_stream_id(&owner.0,&request.stream_id);
     let cancelled = state
         .services
         .chat_completion_service
-        .cancel_stream(&request.stream_id)
+        .close_stream(&request.stream_id)
         .await;
 
     tracing::info!(stream_id = %request.stream_id, cancelled, "Chat completion stream cancel requested");
@@ -227,24 +227,37 @@ pub async fn cancel_stream(
 
 pub async fn cancel_generation(
     State(state): State<SharedState>,
-    Json(request): Json<CancelRequest>,
+    axum::Extension(owner): axum::Extension<crate::browser_resources::RequestOwner>,
+    Json(mut request): Json<CancelRequest>,
 ) -> Result<Json<Value>, ServerError> {
     validate_stream_id(&request.stream_id)?;
+    request.stream_id=scoped_stream_id(&owner.0,&request.stream_id);
     let cancelled = state
         .services
         .chat_completion_service
         .cancel_generation(&request.stream_id)
         .await;
 
+    tracing::info!(stream_id = %request.stream_id, cancelled, "Chat completion generation cancel requested");
     Ok(Json(json!({ "ok": true, "cancelled": cancelled })))
 }
 
 /// Re-attaches to a background generation after the browser lost its socket.
-pub async fn resume(Json(request): Json<ResumeRequest>) -> Result<Response, ServerError> {
+pub async fn resume(axum::Extension(owner): axum::Extension<crate::browser_resources::RequestOwner>, Json(mut request): Json<ResumeRequest>) -> Result<Response, ServerError> {
     validate_stream_id(&request.stream_id)?;
-    let job = crate::background::get(&request.stream_id).ok_or_else(|| {
-        ServerError::NotFound("Background generation expired or the server restarted".into())
-    })?;
+    request.stream_id=scoped_stream_id(&owner.0,&request.stream_id);
+    let job = match crate::background::get(&request.stream_id) {
+        Some(job) => {
+            tracing::info!(stream_id = %request.stream_id, from = request.from, "Background job resumed");
+            job
+        }
+        None => {
+            tracing::info!(stream_id = %request.stream_id, "Background job not found");
+            return Err(ServerError::NotFound(
+                "Background generation expired or the server restarted".into(),
+            ));
+        }
+    };
     Ok(background_response(&job, request.from).await)
 }
 
@@ -258,6 +271,34 @@ async fn background_response(job: &crate::background::Job, from: usize) -> Respo
     ([(http::header::CONTENT_TYPE, "application/json")], body).into_response()
 }
 
+async fn forward_stream(
+    service: &ChatCompletionService,
+    id: &str,
+    mut send: impl FnMut(String) -> bool,
+) -> Result<(), tt_application::errors::ApplicationError> {
+    use tt_application::dto::chat_completion_dto::{ChatCompletionStreamEventDto as EventDto, ChatCompletionStreamStatusDto as Status};
+    let mut after = 0;
+    loop {
+        let read = service.read_stream(id, after).await?;
+        let mut terminal = false;
+        for event in read.events {
+            let (seq, data) = match event {
+                EventDto::Chunk {seq,data} => (seq,data),
+                EventDto::Done {seq} => {terminal=true;(seq,"[DONE]".into())},
+                EventDto::Error {seq,message,details} => {
+                    if !send(json!({"error":{"message":message,"details":details}}).to_string()) { return Ok(()); }
+                    terminal=true;(seq,"[DONE]".into())
+                }
+            };
+            after=seq;
+            if !send(data) { return Ok(()); }
+        }
+        if terminal { return Ok(()); }
+        if read.status != Status::Running { send("[DONE]".into()); return Ok(()); }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+}
+
 /// Runs one provider call detached from any HTTP connection. Cancellation
 /// comes only from the existing cancel endpoints (the Stop button).
 fn spawn_background(
@@ -265,39 +306,50 @@ fn spawn_background(
     id: String,
     job: Arc<crate::background::Job>,
     dto: tt_application::dto::chat_completion_dto::ChatCompletionGenerateRequestDto,
+    log_payload: Option<Value>,
 ) {
     tokio::spawn(async move {
-        if job.stream {
-            let cancel = service.register_stream(&id).await;
-            let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel::<String>();
-            let forward = {
-                let job = job.clone();
-                tokio::spawn(async move {
-                    while let Some(chunk) = receiver.recv().await {
-                        if !chunk.is_empty() {
-                            job.push(chunk);
-                        }
-                    }
-                })
+        let start = std::time::Instant::now();
+        let outcome_str = if job.stream {
+            let outcome = async {
+                service.start_stream(id.clone(), dto).await?;
+                forward_stream(&service, &id, |chunk| { job.push(chunk); true }).await
+            }.await;
+            let status = match log_failed_request(outcome, log_payload.as_ref()) {
+                Ok(()) => "ok",
+                Err(error) => {
+                    tracing::warn!(stream_id = %id, %error, "Background chat completion stream failed");
+                    job.push(json!({"error":{"message":error.to_string()}}).to_string());
+                    job.push("[DONE]".into());
+                    "error"
+                }
             };
-            let outcome = service.generate_stream(dto, sender, cancel).await;
-            let _ = forward.await;
-            if let Err(error) = outcome {
-                tracing::warn!(stream_id = %id, %error, "Background chat completion stream failed");
-                job.push(json!({ "error": { "message": error.to_string() } }).to_string());
-            }
-            job.push("[DONE]".into());
-            service.complete_stream(&id).await;
+            service.close_stream(&id).await;
+            status
         } else {
-            let cancel = service.register_generation(&id).await;
-            let body = match service.generate_with_cancel(dto, cancel).await {
-                Ok(value) => value,
-                Err(error) => json!({ "error": { "message": error.to_string() } }),
+            let (body, status) = match log_failed_request(
+                service.generate_request(&id, dto).await,
+                log_payload.as_ref(),
+            ) {
+                Ok(value) => (value, "ok"),
+                Err(error) => (
+                    json!({ "error": { "message": error.to_string() } }),
+                    "error",
+                ),
             };
             job.push(body.to_string());
-            service.complete_generation(&id).await;
-        }
+            status
+        };
         job.finish();
+        let duration_ms = start.elapsed().as_millis();
+        let events = job.event_count();
+        tracing::info!(
+            stream_id = %id,
+            events,
+            duration_ms,
+            outcome = outcome_str,
+            "Background job finished"
+        );
         tokio::time::sleep(crate::background::RETENTION).await;
         crate::background::remove(&id);
     });
@@ -318,7 +370,7 @@ impl Drop for StreamDisconnectGuard {
         let service = self.service.clone();
         let stream_id = std::mem::take(&mut self.stream_id);
         tokio::spawn(async move {
-            if service.cancel_stream(&stream_id).await {
+            if service.close_stream(&stream_id).await {
                 tracing::info!(
                     stream_id = stream_id.as_str(),
                     "Client disconnected; cancelled the upstream chat completion stream"
@@ -348,7 +400,7 @@ impl<S: Stream> Stream for DisconnectAware<S> {
 }
 
 fn uuid_like() -> String {
-    use rand::RngCore;
+    use rand::Rng;
     let mut bytes = [0u8; 16];
     rand::rng().fill_bytes(&mut bytes);
     hex::encode(bytes)
@@ -372,4 +424,10 @@ mod tests {
         assert!(!wants_stream(&json!({ "stream": false })));
         assert!(!wants_stream(&json!({})));
     }
+}
+
+fn scoped_stream_id(owner:&str,id:&str)->String {
+    use sha2::{Digest,Sha256};
+    let session=owner.split_once(':').map_or(owner,|(session,_)|session);
+    let mut hash=Sha256::new();hash.update(session.as_bytes());hash.update([0]);hash.update(id.as_bytes());hex::encode(hash.finalize())
 }

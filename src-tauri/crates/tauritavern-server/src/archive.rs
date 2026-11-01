@@ -33,7 +33,7 @@ use tt_ports::data_archive::{
     DataArchiveFileGateway, DataRootInitializer, ExportArchiveExecutionRequest,
     ImportArchiveExecutionRequest, UserBackupArchiveExecutionRequest, UserBackupArchiveTarget,
 };
-use tt_ports::sync::DataChangeReconciler;
+use tt_application::services::data_change_reconciler::DataChangeReconciler;
 
 use crate::error::ServerError;
 use crate::state::SharedState;
@@ -61,7 +61,7 @@ pub async fn user_backup(
 
     // One-shot artifact: dispose of it as soon as it is open.
     let file = open_archive(Path::new(&backup.archive_path)).await;
-    if let Err(error) = service.cleanup_user_backup(&backup.archive_path) {
+    if let Err(error) = state.services.archive_files.cleanup_export(Path::new(&backup.archive_path)) {
         tracing::warn!(%error, "Failed to clean up user backup archive");
     }
     zip_attachment(file?, &backup.file_name).await
@@ -80,18 +80,13 @@ pub async fn export_download(
     Query(query): Query<ExportDownloadQuery>,
 ) -> Result<Response, ServerError> {
     let service = &state.services.data_archive_service;
-    let archive_path = service.completed_export_archive_path(&query.id)?;
-    let file_name = service
-        .get_status(&query.id)?
-        .result
-        .and_then(|result| result.file_name)
-        .ok_or_else(|| ServerError::Internal("Export archive file name is missing".into()))?;
-
-    let file = open_archive(&archive_path).await?;
-    if let Some(error) = service.finalize_export_delivery(&query.id, None)? {
+    let artifact = service.claim_export_artifact(&query.id)?;
+    let file = open_archive(&artifact.archive_path).await;
+    if let Err(error) = state.services.archive_files.cleanup_export(&artifact.archive_path) {
         tracing::warn!(%error, "Failed to clean up delivered export archive");
     }
-    zip_attachment(file, &file_name).await
+    service.finish_export_delivery(&query.id)?;
+    zip_attachment(file?, &artifact.file_name).await
 }
 
 async fn open_archive(path: &Path) -> Result<tokio::fs::File, ServerError> {
@@ -257,6 +252,9 @@ impl DataArchiveFileGateway for ServerDataArchiveFiles {
     }
 
     fn cleanup_export(&self, archive_path: &Path) -> Result<(), DomainError> {
+        if archive_path.parent() != Some(self.exports_root.as_path()) {
+            return Err(DomainError::InvalidData("Archive path is outside export staging".into()));
+        }
         fs::remove_file(archive_path).map_err(|error| {
             if error.kind() == std::io::ErrorKind::NotFound {
                 DomainError::NotFound(format!(
@@ -272,36 +270,6 @@ impl DataArchiveFileGateway for ServerDataArchiveFiles {
         })
     }
 
-    fn save_export(&self, _archive_path: &Path, _file_name: &str) -> Result<PathBuf, DomainError> {
-        Err(DomainError::InvalidData(
-            "Server mode delivers exports as browser downloads".into(),
-        ))
-    }
-
-    fn save_user_backup(
-        &self,
-        _archive_path: &str,
-        _file_name: &str,
-    ) -> Result<PathBuf, DomainError> {
-        Err(DomainError::InvalidData(
-            "Server mode delivers backups as browser downloads".into(),
-        ))
-    }
-
-    fn cleanup_user_backup(&self, archive_path: &str) -> Result<(), DomainError> {
-        let path = Path::new(archive_path);
-        if path.parent() != Some(self.exports_root.as_path()) {
-            return Err(DomainError::InvalidData(format!(
-                "User backup archive path is outside the staging directory: {archive_path}"
-            )));
-        }
-        if let Err(error) = fs::remove_file(path)
-            && error.kind() != std::io::ErrorKind::NotFound
-        {
-            tracing::warn!(%error, path = %path.display(), "Failed to clean up user backup archive");
-        }
-        Ok(())
-    }
 }
 
 /// One plain path component naming a real user directory inside the data root.
@@ -359,6 +327,7 @@ pub struct ServiceCacheReconciler {
     pub secret_service: Arc<SecretService>,
     pub settings_service: Arc<SettingsService>,
     pub chat_history_coordinator: Arc<ChatHistoryCoordinator>,
+    pub mcp_service: Arc<tt_application::services::mcp_service::McpService>,
 }
 
 #[async_trait]
@@ -370,13 +339,13 @@ impl DataChangeReconciler for ServiceCacheReconciler {
         );
 
         self.chat_history_coordinator.invalidate_all_pending().await;
+        self.mcp_service.clear_catalog_memory();
         self.character_service.clear_cache().await?;
         self.chat_service.clear_cache().await?;
         self.group_chat_service.clear_cache().await?;
         self.group_service.clear_cache().await?;
         self.secret_service.clear_cache().await?;
-        self.settings_service.clear_cache().await;
-        self.settings_service.reload_chat_backup_settings().await?;
+        self.settings_service.reload().await?;
         Ok(())
     }
 }
@@ -420,7 +389,7 @@ fn timestamp() -> String {
 }
 
 fn random_id() -> String {
-    use rand::RngCore;
+    use rand::Rng;
     let mut bytes = [0u8; 16];
     rand::rng().fill_bytes(&mut bytes);
     hex::encode(bytes)
@@ -468,5 +437,17 @@ mod tests {
             "default-user-20261001-120000.zip"
         );
         assert_eq!(attachment_file_name("a\"b;c=d.zip"), "a_b_c_d.zip");
+    }
+
+    #[test]
+    fn cleanup_cannot_remove_files_outside_export_staging() {
+        let root = std::env::temp_dir().join(format!("tt-export-cleanup-{}", random_id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let outside = root.join("keep.txt");
+        std::fs::write(&outside, b"keep").unwrap();
+        let gateway = ServerDataArchiveFiles::new(&root);
+        assert!(gateway.cleanup_export(&outside).is_err());
+        assert_eq!(std::fs::read(&outside).unwrap(), b"keep");
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

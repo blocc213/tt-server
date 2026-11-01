@@ -10,7 +10,9 @@ import { registerCharacterRoutes } from './character-routes.js';
 import { registerChatRoutes } from './chat-routes.js';
 import { registerBackupsRoutes } from './backups-routes.js';
 import { registerAiRoutes } from './ai-routes.js';
+import { registerTokenizerRoutes } from './tokenizer-routes.js';
 import { registerProviderRoutes } from './provider-routes.js';
+import { registerSearchRoutes } from './search-routes.js';
 import { registerStatsRoutes } from './stats-routes.js';
 import { registerWorldInfoRoutes } from './worldinfo-routes.js';
 import { registerContentRoutes } from './content-routes.js';
@@ -19,6 +21,7 @@ import { registerSdRoutes } from './sd-routes.js';
 import { registerTranslateRoutes } from './translate-routes.js';
 import { registerTtsRoutes } from './tts-routes.js';
 import { registerVectorRoutes } from './vector-routes.js';
+import { registerSpriteRoutes } from './sprite-routes.js';
 
 /**
  * Endpoints the server host answers itself.
@@ -26,17 +29,13 @@ import { registerVectorRoutes } from './vector-routes.js';
  * Under the app these are emulated in the page because there is no HTTP server
  * to talk to. Under the server host they are real routes, and the interceptor
  * must not shadow them: `/api/bootstrap` and `/csrf-token` exist server-side,
- * chat read/save carry the revision token that the in-page emulation has no way
- * to produce, and generation must stream as SSE from the server rather than
- * being reassembled from an IPC channel.
+ * while generation must stream as SSE from the server rather than being
+ * reassembled from an IPC channel. Chat routes stay in-page so legacy plugins
+ * use the same loaded-revision commit path as the application.
  */
 const SERVER_NATIVE_ENDPOINTS = Object.freeze(new Set([
     '/csrf-token',
     '/api/bootstrap',
-    '/api/chats/get',
-    '/api/chats/save',
-    '/api/tauritavern/group-chats/get',
-    '/api/tauritavern/group-chats/save',
     '/api/users/backup',
     '/api/backends/chat-completions/status',
     '/api/backends/chat-completions/generate',
@@ -66,8 +65,11 @@ export function registerRoutes(router, context, responses) {
     registerAssetsRoutes(router, context, responses);
     registerWorldInfoRoutes(router, context, responses);
     registerAiRoutes(router, context, responses);
+    registerTokenizerRoutes(router, context, responses);
     registerVectorRoutes(router, context, responses);
+    registerSpriteRoutes(router, context, responses);
     registerProviderRoutes(router, context, responses);
+    registerSearchRoutes(router, context, responses);
     registerSdRoutes(router, context, responses);
     registerTranslateRoutes(router, context, responses);
     registerTtsRoutes(router, context, responses);

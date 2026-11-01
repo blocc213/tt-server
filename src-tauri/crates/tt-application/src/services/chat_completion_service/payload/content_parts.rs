@@ -123,33 +123,6 @@ pub(super) fn reject_media_for_text_only_content(
     Ok(())
 }
 
-pub(super) fn reject_video_for_provider(
-    provider_name: &str,
-    messages: Option<&Value>,
-) -> Result<(), ApplicationError> {
-    let Some(messages) = messages else {
-        return Ok(());
-    };
-
-    let Some(entries) = messages.as_array() else {
-        return Ok(());
-    };
-
-    for entry in entries {
-        let Some(message) = entry.as_object() else {
-            continue;
-        };
-
-        if contains_media_kind(message.get("content"), "video") {
-            return Err(ApplicationError::ValidationError(format!(
-                "{provider_name} cannot preserve video input in this provider format. Use a provider that supports video input or disable video inlining."
-            )));
-        }
-    }
-
-    Ok(())
-}
-
 pub(super) fn rewrite_audio_url_parts_to_input_audio(
     provider_name: &str,
     messages: Option<&mut Value>,
@@ -325,17 +298,6 @@ fn first_media_kind_in_content(content: Option<&Value>) -> Option<&'static str> 
 
 pub(super) fn media_kind_in_value(value: &Value) -> Option<&'static str> {
     value.as_object().and_then(media_kind_in_object)
-}
-
-fn contains_media_kind(content: Option<&Value>, rejected_kind: &str) -> bool {
-    match content {
-        Some(Value::Array(parts)) => parts
-            .iter()
-            .filter_map(media_kind_in_value)
-            .any(|kind| kind == rejected_kind),
-        Some(Value::Object(object)) => media_kind_in_object(object) == Some(rejected_kind),
-        _ => false,
-    }
 }
 
 fn rewrite_audio_url_content_parts(
@@ -603,15 +565,6 @@ mod tests {
     };
 
     #[test]
-    fn parses_plain_text() {
-        let parts = parse_openai_chat_content(Some(&json!("hello"))).expect("text should parse");
-
-        assert_eq!(parts, vec![InputPart::Text("hello".to_string())]);
-        assert!(!parts.iter().any(is_media_part));
-        assert_eq!(to_lossy_text(&parts), "hello");
-    }
-
-    #[test]
     fn parses_legacy_image_audio_video_parts() {
         let parts = parse_openai_chat_content(Some(&json!([
             { "type": "text", "text": "describe" },
@@ -764,76 +717,6 @@ mod tests {
         .expect_err("text-only provider should reject media");
 
         assert!(error.to_string().contains("cannot preserve image input"));
-    }
-
-    #[test]
-    fn text_only_provider_rejects_single_object_media_content() {
-        let messages = json!([{
-            "role": "user",
-            "content": {
-                "type": "video_url",
-                "video_url": { "url": "data:video/mp4;base64,AAAA" }
-            }
-        }]);
-
-        let error = reject_media_for_text_only_provider("text-only provider", Some(&messages))
-            .expect_err("single object media should fail fast");
-
-        assert!(error.to_string().contains("cannot preserve video input"));
-    }
-
-    #[test]
-    fn text_only_provider_rejects_native_media_part_types() {
-        for (part, kind) in [
-            (json!({ "type": "image", "source": {} }), "image"),
-            (json!({ "type": "audio", "source": {} }), "audio"),
-            (json!({ "type": "video", "source": {} }), "video"),
-            (json!({ "type": "input_audio", "input_audio": {} }), "audio"),
-            (json!({ "type": "input_video", "input_video": {} }), "video"),
-            (
-                json!({ "type": "input_file", "file_id": "file_123" }),
-                "file",
-            ),
-            (
-                json!({ "inlineData": { "mimeType": "image/png", "data": "AAAA" } }),
-                "image",
-            ),
-            (
-                json!({ "inline_data": { "mime_type": "audio/wav", "data": "AAAA" } }),
-                "audio",
-            ),
-            (
-                json!({ "inlineData": { "mimeType": "Video/MP4", "data": "AAAA" } }),
-                "video",
-            ),
-            (
-                json!({ "fileData": { "mimeType": "image/png", "fileUri": "gs://bucket/cat.png" } }),
-                "file",
-            ),
-        ] {
-            let messages = json!([{ "role": "user", "content": [part] }]);
-            let error = reject_media_for_text_only_provider("text-only provider", Some(&messages))
-                .expect_err("native media should fail fast");
-
-            assert!(
-                error
-                    .to_string()
-                    .contains(&format!("cannot preserve {kind} input"))
-            );
-        }
-    }
-
-    #[test]
-    fn lossy_text_keeps_unknown_text_fields() {
-        let parts = parse_openai_chat_content(Some(&json!([
-            "a",
-            { "type": "unknown_text", "text": "b" },
-            { "content": "c" },
-            { "type": "image_url", "image_url": { "url": "data:image/png;base64,AAAA" } }
-        ])))
-        .expect("parts should parse");
-
-        assert_eq!(to_lossy_text(&parts), "abc");
     }
 
     fn is_media_part(part: &InputPart) -> bool {

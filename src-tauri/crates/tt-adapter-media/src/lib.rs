@@ -1,5 +1,6 @@
 mod host_resources;
 mod persistence;
+pub mod persona_cards;
 mod repositories;
 mod thumbnails;
 mod user_file_store;
@@ -11,3 +12,6 @@ pub use repositories::{
 };
 pub use user_file_store::FilesystemUserFileStore;
 pub use user_media_store::FilesystemUserMediaStore;
+mod tool_images;
+pub mod window_backdrop;
+pub use tool_images::MediaToolImageNormalizer;

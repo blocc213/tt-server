@@ -1,41 +1,5 @@
 use super::MAX_LIST_ENTRIES;
-use super::policy::WorkspaceAccessPolicy;
-use tt_ports::repositories::workspace_repository::{WorkspaceEntryKind, WorkspaceFileList};
-
-pub(super) fn filter_visible_entries(
-    list: WorkspaceFileList,
-    policy: &WorkspaceAccessPolicy,
-) -> WorkspaceFileList {
-    WorkspaceFileList {
-        truncated: list.truncated,
-        entries: list
-            .entries
-            .into_iter()
-            .filter(|entry| policy.is_visible(&entry.path))
-            .collect(),
-    }
-}
-
-pub(super) fn split_lines_for_display(text: &str) -> Vec<&str> {
-    if text.is_empty() {
-        return Vec::new();
-    }
-    text.split('\n').collect()
-}
-
-pub(super) fn format_lines_with_numbers(lines: &[&str], start_line: usize) -> String {
-    if lines.is_empty() {
-        return String::new();
-    }
-    let last_line = start_line + lines.len() - 1;
-    let width = last_line.to_string().len();
-    lines
-        .iter()
-        .enumerate()
-        .map(|(index, line)| format!("{:>width$} | {}", start_line + index, line, width = width))
-        .collect::<Vec<_>>()
-        .join("\n")
-}
+use tt_ports::workspace_fs::{WorkspaceEntryKind, WorkspaceFileList};
 
 pub(super) fn render_file_list(list: &WorkspaceFileList) -> String {
     if list.entries.is_empty() {

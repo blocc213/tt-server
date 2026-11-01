@@ -16,6 +16,8 @@ const handle = api.current.handle();
 
 ## 1. 核心入口
 
+启用[历史滑动按需加载](../CurrentState/ChatPayload.md#21-历史滑动按需加载)时，`getContext().chat` 的历史候选槽位可能为 null；本页后端读取 API 仍返回完整内容。
+
 | 方法 | 返回值 | 说明 |
 | --- | --- | --- |
 | `api.chat.open(ref)` | `ChatHandle` | 打开指定聊天 |
@@ -102,6 +104,7 @@ const hits = await handle.searchMessages({
 **技术特点**：
 - 基于片段命中评分 + TopK 召回（非向量检索，轻量高效）
 - CJK / 无空格文本自动 bigram 分词，大幅提升中日韩文匹配率
+- 纯标点或符号 query 中的连续片段按原始字符序列做字面量子串匹配；混合 query 继续使用既有分词评分语义
 - `scanLimit` 控制性能上限，移动端友好
 
 ---
@@ -161,7 +164,7 @@ await handle.metadata.setExtension({ namespace: 'my-ext', value: { lastFloor: 42
 await handle.metadata.setExtension({ namespace: 'my-ext', value: null });
 ```
 
-数据存储在 `chat_metadata.extensions[namespace]` 中，跨端可迁移，开销稳定。
+数据存储在 `chat_metadata.extensions[namespace]` 中，与聊天文件一同迁移。每次调用只修改指定 namespace，不自动合并到当前页面的活 metadata。
 
 ---
 
@@ -174,6 +177,8 @@ const summary = await handle.summary({ includeMetadata: true });
 // 获取可持久化的稳定 ID
 const id = await handle.stableId();
 ```
+
+`summary()` 默认只返回轻量摘要。`includeMetadata: true` 返回完整 metadata，读取成本随返回数据大小增长。
 
 ---
 

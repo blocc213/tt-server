@@ -66,7 +66,7 @@ async function getSourceContextSize() {
         return overrideLength > 0 ? (maxContext - overrideLength) : Math.round(maxContext * 0.75);
     }
 
-    if (extension_settings.source === summary_sources.extras) {
+    if (extension_settings.memory.source === summary_sources.extras) {
         return 1024 - 64;
     }
 
@@ -107,7 +107,7 @@ const defaultTemplate = '[Summary: {{summary}}]';
 const defaultSettings = {
     memoryFrozen: false,
     SkipWIAN: false,
-    source: summary_sources.extras,
+    source: summary_sources.main,
     prompt: defaultPrompt,
     template: defaultTemplate,
     position: extension_prompt_types.IN_PROMPT,
@@ -358,9 +358,8 @@ function getLatestMemoryFromChat(chat) {
         return '';
     }
 
-    const reversedChat = chat.slice().reverse();
-    reversedChat.shift();
-    for (let mes of reversedChat) {
+    for (let index = chat.length - 2; index >= 0; index--) {
+        const mes = chat[index];
         if (mes.extra && mes.extra.memory) {
             return mes.extra.memory;
         }
@@ -1108,16 +1107,22 @@ export async function init() {
         returns: ARGUMENT_TYPE.STRING,
     }));
 
+    const macroData = Object.freeze({
+        get summary() { return getLatestMemoryFromChat(getContext().chat); },
+    });
+    macros.envBuilder.registerProvider(env => {
+        env.extra.memory = macroData;
+    });
     if (power_user.experimental_macro_engine) {
         macros.register('summary', {
             category: MacroCategory.CHAT,
             description: 'Returns the latest memory/summary from the current chat.',
-            handler: () => getLatestMemoryFromChat(getContext().chat),
+            handler: ({ env }) => env.extra.memory?.summary ?? '',
         });
     } else {
         // TODO: Remove this when the experimental macro engine is replacing the old macro engine
         MacrosParser.registerMacro('summary',
-            () => getLatestMemoryFromChat(getContext().chat),
+            (_nonce, env) => env.extra.memory?.summary ?? '',
             'Returns the latest memory/summary from the current chat.');
     }
 }

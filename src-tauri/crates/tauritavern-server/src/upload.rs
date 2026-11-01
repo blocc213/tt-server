@@ -238,7 +238,7 @@ fn sanitize_extension(value: &str) -> Result<&str, ServerError> {
 }
 
 fn random_id() -> String {
-    use rand::RngCore;
+    use rand::Rng;
     let mut bytes = [0u8; 16];
     rand::rng().fill_bytes(&mut bytes);
     hex::encode(bytes)

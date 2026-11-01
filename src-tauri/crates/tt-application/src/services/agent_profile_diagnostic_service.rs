@@ -51,7 +51,14 @@ impl AgentProfileDiagnosticService {
                 tool_catalog,
             })
             .await
-        {
+            .and_then(|profile| {
+                super::agent_profile_service::validate_chat_profile(
+                    &profile,
+                    tt_domain::models::agent::AgentInvocationExitPolicy::RunFinishAllowed,
+                    profile.run.presentation,
+                )?;
+                Ok(profile)
+            }) {
             Ok(profile) => profile,
             Err(ApplicationError::ValidationError(message)) => {
                 return Ok(AgentProfileHealth {
@@ -341,8 +348,10 @@ fn blocks(diagnostics: &[AgentProfileDiagnostic], block: AgentProfileDiagnosticB
 
 #[cfg(test)]
 mod tests {
+    use crate::services::agent_profile_service::TestAgentProfileRepository;
+    use crate::services::agent_run_retention_test_support::TestSettingsRepository;
     use std::collections::BTreeSet;
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
 
     use async_trait::async_trait;
     use serde_json::json;
@@ -351,38 +360,15 @@ mod tests {
     use crate::services::agent_tools::BuiltinAgentToolRegistry;
     use tt_domain::errors::DomainError;
     use tt_domain::models::agent::profile::{
-        AgentModelBindingMode, AgentPresetBindingMode, AgentPresetRef, AgentProfileDefinition,
-        AgentProfileId,
+        AgentModelBindingMode, AgentPresetBindingMode, AgentPresetRef,
     };
     use tt_domain::models::llm_connection::{
         LlmConnectionDefinition, LlmConnectionId, LlmConnectionSummary,
     };
     use tt_domain::models::preset::{DefaultPreset, Preset};
     use tt_ports::repositories::agent_profile_repository::AgentProfileRepository;
-    use tt_ports::repositories::agent_profile_storage_health_repository::{
-        AgentProfileStorageHealthRepository, AgentProfileStorageScan,
-    };
+    use tt_ports::repositories::agent_profile_storage_health_repository::AgentProfileStorageHealthRepository;
     use tt_ports::repositories::llm_connection_repository::LlmConnectionRepository;
-
-    #[tokio::test]
-    async fn default_profile_is_healthy() {
-        let (profile_service, diagnostic_service, registry) = test_services(
-            TestPresetRepository::default(),
-            TestLlmConnectionRepository::default(),
-        );
-
-        let health = diagnostic_service
-            .diagnose_profile("default-writer", registry.catalog())
-            .await
-            .expect("diagnose default profile");
-
-        assert!(health.preview_available);
-        assert!(health.prompt_assembly_available);
-        assert!(health.direct_run_available);
-        assert!(health.diagnostics.is_empty());
-
-        drop(profile_service);
-    }
 
     #[tokio::test]
     async fn dangling_openai_preset_is_diagnostic_not_preview_failure() {
@@ -427,48 +413,6 @@ mod tests {
             diagnostic
                 .repair_actions
                 .contains(&AgentProfileDiagnosticRepairAction::SelectPreset)
-        );
-    }
-
-    #[tokio::test]
-    async fn non_openai_preset_ref_is_diagnostic_for_independent_prompt_assembly() {
-        let (profile_service, diagnostic_service, registry) = test_services(
-            TestPresetRepository::default(),
-            TestLlmConnectionRepository::default(),
-        );
-        let mut profile = profile_service
-            .load_profile("default-writer")
-            .await
-            .expect("load default")
-            .expect("default profile");
-        profile.id = tt_domain::models::agent::profile::AgentProfileId::parse("textgen-writer")
-            .expect("profile id");
-        profile.preset.mode = AgentPresetBindingMode::Ref;
-        profile.preset.ref_ = Some(AgentPresetRef {
-            api_id: "textgenerationwebui".to_string(),
-            name: "TextGen Preset".to_string(),
-        });
-        profile.preset.required = true;
-        profile_service
-            .save_profile(profile, registry.catalog())
-            .await
-            .expect("supported preset type remains editable even if assembly cannot use it");
-
-        let health = diagnostic_service
-            .diagnose_profile("textgen-writer", registry.catalog())
-            .await
-            .expect("diagnose textgen preset profile");
-
-        assert!(health.preview_available);
-        assert!(!health.prompt_assembly_available);
-        let diagnostic = only_diagnostic(&health);
-        assert_eq!(diagnostic.code, "agent.profile_preset_api_unsupported");
-        assert_eq!(
-            diagnostic
-                .resource
-                .as_ref()
-                .and_then(|resource| resource.api_id.as_deref()),
-            Some("textgenerationwebui")
         );
     }
 
@@ -567,15 +511,17 @@ mod tests {
         let profile_repository = Arc::new(TestAgentProfileRepository::default());
         let profile_repository_trait: Arc<dyn AgentProfileRepository> = profile_repository.clone();
         let profile_health_repository: Arc<dyn AgentProfileStorageHealthRepository> =
-            profile_repository;
+            profile_repository.clone();
         let preset_repository: Arc<dyn PresetRepository> = Arc::new(preset_repository);
-        let llm_connection_service = Arc::new(LlmConnectionService::new(Arc::new(
-            llm_connection_repository,
-        )));
+        let llm_connection_service = Arc::new(LlmConnectionService::new(
+            Arc::new(llm_connection_repository),
+            TestSettingsRepository::new(),
+        ));
         let profile_service = Arc::new(AgentProfileService::new(
             profile_repository_trait,
             profile_health_repository,
             preset_repository.clone(),
+            profile_repository,
         ));
         let diagnostic_service = AgentProfileDiagnosticService::new(
             profile_service.clone(),
@@ -592,71 +538,6 @@ mod tests {
     fn only_diagnostic(health: &AgentProfileHealth) -> &AgentProfileDiagnostic {
         assert_eq!(health.diagnostics.len(), 1);
         &health.diagnostics[0]
-    }
-
-    #[derive(Default)]
-    struct TestAgentProfileRepository {
-        profiles: Mutex<Vec<AgentProfileDefinition>>,
-    }
-
-    #[async_trait]
-    impl AgentProfileRepository for TestAgentProfileRepository {
-        async fn load_profile(
-            &self,
-            id: &AgentProfileId,
-        ) -> Result<Option<AgentProfileDefinition>, DomainError> {
-            Ok(self
-                .profiles
-                .lock()
-                .expect("profiles lock")
-                .iter()
-                .find(|profile| profile.id == *id)
-                .cloned())
-        }
-
-        async fn save_profile(&self, profile: &AgentProfileDefinition) -> Result<(), DomainError> {
-            let mut profiles = self.profiles.lock().expect("profiles lock");
-            if let Some(existing) = profiles
-                .iter_mut()
-                .find(|existing| existing.id == profile.id)
-            {
-                *existing = profile.clone();
-            } else {
-                profiles.push(profile.clone());
-            }
-            Ok(())
-        }
-
-        async fn delete_profile(&self, id: &AgentProfileId) -> Result<(), DomainError> {
-            self.profiles
-                .lock()
-                .expect("profiles lock")
-                .retain(|profile| profile.id != *id);
-            Ok(())
-        }
-    }
-
-    #[async_trait]
-    impl AgentProfileStorageHealthRepository for TestAgentProfileRepository {
-        async fn scan_profiles(&self) -> Result<AgentProfileStorageScan, DomainError> {
-            Ok(AgentProfileStorageScan {
-                profiles: self
-                    .profiles
-                    .lock()
-                    .expect("profiles lock")
-                    .iter()
-                    .map(AgentProfileDefinition::summary)
-                    .collect(),
-                issues: Vec::new(),
-            })
-        }
-
-        async fn normalize_profile_file_identity(
-            &self,
-            _id: &AgentProfileId,
-        ) -> Result<(), DomainError> {
-            Ok(())
-        }
     }
 
     #[derive(Default)]

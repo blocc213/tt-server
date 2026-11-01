@@ -28,3 +28,7 @@ docker-data
 coverage
 *.log
 /tmp
+.tooling
+.phase2-smoke
+.cache
+dev-data

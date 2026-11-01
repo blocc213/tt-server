@@ -14,6 +14,59 @@ const GENERATE_URL = '/api/backends/chat-completions/generate';
 const RESUME_URL = '/api/backends/chat-completions/resume';
 const MAX_RESUME_ATTEMPTS = 20;
 
+const JOB_PREFIX = 'tt_bg_job:';
+const activeJobs = new Set();
+export function markBackgroundTarget(message, streamId) {
+    if (!activeJobs.has(streamId)) return;
+    const key = JOB_PREFIX + streamId;
+    const record = JSON.parse(localStorage.getItem(key) ?? 'null');
+    if (!record) return;
+    message.extra ??= {};
+    message.extra.background_job_id = streamId;
+    record.targetToken = streamId;
+    record.targetAfterStart = JSON.stringify(message);
+    record.messageCountAfterStart = record.messageCount + (record.type === 'normal' ? 1 : 0);
+    localStorage.setItem(key, JSON.stringify(record));
+}
+let pageUnloading = false;
+export function detachBackgroundPage() { pageUnloading = true; }
+// Installed during module evaluation, before script.js installs its jQuery listener.
+window.addEventListener('beforeunload', () => { pageUnloading = true; }, true);
+window.addEventListener('pagehide', () => { pageUnloading = true; }, true);
+window.addEventListener('pageshow', () => { pageUnloading = false; }, true);
+
+export async function recoverBackgroundJobs(context, consume, apply, notify, getHeaders) {
+    const keys = Object.keys(localStorage).filter(key => key.startsWith(JOB_PREFIX));
+    for (const key of keys) {
+        let record;
+        try { record = JSON.parse(localStorage.getItem(key)); } catch { localStorage.removeItem(key); continue; }
+        if (!record || Date.now() - record.createdAt > 2 * 60 * 60 * 1000) {
+            localStorage.removeItem(key);
+            continue;
+        }
+        if (activeJobs.has(record.streamId) || record.chatId !== context.chatId
+            || record.characterId !== context.characterId || record.groupId !== context.groupId) continue;
+        // ponytail: synchronous claim, not an atomic cross-tab lock; server fencing if strict multi-tab ownership matters.
+        localStorage.removeItem(key);
+        activeJobs.add(record.streamId);
+        try {
+            const response = await fetch(RESUME_URL, {
+                method: 'POST', headers: getHeaders(),
+                body: JSON.stringify({ stream_id: record.streamId, from: 0 }),
+            });
+            if (response.status === 404) { notify('expired', record); continue; }
+            if (!response.ok) throw new Error(`Resume failed (${response.status})`);
+            const result = await consume(response, record);
+            await apply(result, record);
+        } catch (error) {
+            localStorage.setItem(key, JSON.stringify(record));
+            notify('failed', record, error);
+        } finally {
+            activeJobs.delete(record.streamId);
+        }
+    }
+}
+
 export function isBackgroundGenerationAvailable() {
     return isServerEnv();
 }
@@ -76,9 +129,18 @@ function cancelOnServer(streamId, stream) {
  * @param {AbortSignal} signal Stop signal
  * @param {() => Record<string,string>} getHeaders Request headers factory
  */
-export async function sendBackgroundGenerateRequest(generateData, stream, signal, getHeaders) {
+export async function sendBackgroundGenerateRequest(generateData, stream, signal, getHeaders, context = {}) {
     const streamId = `bg-${uuidv4()}`;
-    const onAbort = () => cancelOnServer(streamId, stream);
+    const key = JOB_PREFIX + streamId;
+    const record = { ...context, streamId, stream, createdAt: Date.now(), source: generateData.chat_completion_source, model: generateData.model };
+    localStorage.setItem(key, JSON.stringify(record));
+    activeJobs.add(streamId);
+    const complete = () => { localStorage.removeItem(key); activeJobs.delete(streamId); };
+    const onAbort = () => {
+        if (pageUnloading) return;
+        complete();
+        cancelOnServer(streamId, stream);
+    };
     signal.addEventListener('abort', onAbort, { once: true });
 
     const post = (url, body) => fetch(url, {
@@ -93,7 +155,7 @@ export async function sendBackgroundGenerateRequest(generateData, stream, signal
     const open = async (from) => {
         let lastError;
         for (let attempt = 0; attempt < MAX_RESUME_ATTEMPTS; attempt++) {
-            await waitUntilForeground(signal);
+            if (from !== null) await waitUntilForeground(signal);
             try {
                 return from === null
                     ? await post(GENERATE_URL, { ...generateData, stream_id: streamId, background: true })
@@ -112,10 +174,16 @@ export async function sendBackgroundGenerateRequest(generateData, stream, signal
         response = await open(null);
     } catch (error) {
         signal.removeEventListener('abort', onAbort);
+        activeJobs.delete(streamId);
         throw error;
     }
     if (!stream || !response.ok) {
-        signal.removeEventListener('abort', onAbort);
+        response.backgroundJobId = streamId;
+        response.backgroundComplete = () => {
+            signal.removeEventListener('abort', onAbort);
+            complete();
+        };
+        if (!response.ok) response.backgroundComplete();
         return response;
     }
 
@@ -163,10 +231,11 @@ export async function sendBackgroundGenerateRequest(generateData, stream, signal
                 }
             } catch (error) {
                 signal.removeEventListener('abort', onAbort);
+                activeJobs.delete(streamId);
                 controller.error(error);
             }
         },
     });
 
-    return { ok: true, status: 200, body };
+    return { ok: true, status: 200, body, backgroundJobId: streamId, backgroundComplete: complete };
 }

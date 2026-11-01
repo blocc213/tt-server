@@ -1,6 +1,6 @@
 [package]
 name = "tauritavern-server"
-version = "2.2.0"
+version = "2.4.0"
 description = "TauriTavern served over HTTP for browser clients on a shared server"
 authors = ["TauriTavern Team"]
 edition = "2024"
@@ -47,3 +47,8 @@ tt-adapter-provider-http = { path = "../tt-adapter-provider-http" }
 tt-adapter-storage-core = { path = "../tt-adapter-storage-core" }
 tt-adapter-storage-userdata = { path = "../tt-adapter-storage-userdata" }
 tt-adapter-media = { path = "../tt-adapter-media" }
+tt-adapter-mcp = { path = "../tt-adapter-mcp" }
+tt-adapter-vector = { path = "../tt-adapter-vector" }
+tt-adapter-triviumdb = { path = "../tt-adapter-triviumdb" }
+tt-adapter-workspace-shell = { path = "../tt-adapter-workspace-shell" }
+parking_lot = "0.12"

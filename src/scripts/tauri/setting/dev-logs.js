@@ -2,6 +2,7 @@ import { POPUP_TYPE } from '../../popup.js';
 import { isServerEnv } from '../../../tauri-bridge.js';
 import { translate } from '../../i18n.js';
 import { trimFrontendLogEntriesInPlace } from '../../../tauri/main/services/dev-logging/frontend-log-retention.js';
+import { writeClipboardText } from '../../../tauri-bridge.js';
 import { openFullscreenTextViewer } from './text-viewer-popup.js';
 import { runTaskOrPopup, showErrorPopup } from './setting-panel/popup-utils.js';
 import { callTauriTavernPanelPopup } from './panel-popup.js';
@@ -29,13 +30,13 @@ function ensureDevLogsStyle() {
 }
 
 async function importDevLogsBundle() {
-    return import(new URL('./dist/dev-logs.bundle.js', import.meta.url).href);
+    return import('/scripts/tauri/setting/dist/dev-logs.bundle.js' /* webpackIgnore: true */);
 }
 
 function createActions() {
     return {
         copyText: (text) => runTaskOrPopup(async () => {
-            await navigator.clipboard.writeText(String(text ?? ''));
+            await writeClipboardText(String(text ?? ''));
         }),
         openTextViewer: (options) => runTaskOrPopup(async () => {
             await openFullscreenTextViewer(options);

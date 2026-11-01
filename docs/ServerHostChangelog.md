@@ -2,6 +2,20 @@
 
 本文记录把 TauriTavern 以纯浏览器 + HTTP 服务器形式运行（`src-tauri/crates/tauritavern-server`）的改造工作。上游 TauriTavern 只有桌面/移动宿主；服务器宿主是本分支新增的，复用同一套 application service 与 adapter，不另写业务逻辑。
 
+## 2.4 升级
+
+- 以 upstream v2.4.0 的分块提交、原始文档字节与 reader/cold-swipe 架构为准；不恢复旧 `chat_payload_commit_*`、旧设置视图或 native picker 浏览器调用。
+- 字节长度/SHA-256 聊天版本前置条件迁入共享 ChatCommit 层，保留新建、条件替换和显式强制覆盖的区别；冲突时保留浏览器未保存内容。
+- HTTP 宿主适配 2.4 设置、世界书、扩展存储、文件 staging 与二进制读写协议；reader 资源按已认证客户端会话隔离，不能跨会话读取。
+- 保留 opt-in 后台生成的页面关闭恢复、原聊天目标核对、停止取消与过期处理；保留带凭据脱敏的服务端 LLM 控制台日志。日志仍包含提示词和非流式回复，必须按私密数据保护。
+- 浏览器保留设置按钮和后台生成开关；原生 Android 的前台服务/AI 通知生命周期完全沿用 upstream 2.4。原生窗口、LAN Sync、文件选择/系统交付与调试包不作为服务器 RPC 暴露。
+- 浏览器迁移导入通过受限 staging，导出通过 HTTP 下载；保留 upstream 归档 artifact 的领取生命周期和密钥/暂存目录排除策略。
+- 升级不带入生成 schemas、Gradle 缓存或本地私有调查计划；部署与用户数据不属于源码合并范围。
+- 原生 Channel 依赖的 Agent 实时投影/运行交互与浏览器扩展工具回调在服务器界面明确提示不可用；不伪装空成功。MCP、SearXNG、vector 等无 Channel 的服务沿共享实现接入。
+- 自定义网络端点使用 upstream 访问许可模型；服务器许可记录位于专用 `.server-security`，不包含于导出且归档导入拒绝该路径，避免从归档授予网络权限。
+- 真实浏览器启动不注册 native graceful-exit 监听，但保留 pagehide/beforeunload 的持久化 flush。核心模板和扩展模板由 `read_frontend_template` / `read_frontend_extension_template` 共享模板服务读取；模板资源限定于前端目录，拒绝路径穿越与符号链接越界。
+
+
 ## 一、基础架构
 
 - `tauritavern-server`：基于 axum 的 HTTP 宿主。`rpc.rs` 维护 `EXPOSED_COMMANDS` 白名单，把浏览器调用分派给与桌面命令相同的 application service；`composition.rs` 组装服务；构建守卫禁止它依赖桌面 app-shell crate。
@@ -68,10 +82,19 @@
 ## 七、未实现
 
 - 原生专属能力：iOS picker/分享、系统通知、LAN Sync、桌面开发日志订阅——浏览器无对应能力。
-- TT 与 SillyTavern 共有的差距：vector 系列、caption、统计、UUID 导入、Node 插件、多用户等。
+- 统计、UUID 导入、Node 插件、多用户等仍非服务器宿主能力。2.4 的 vector 共享服务已接入；此处旧版 vector 差距不再适用。
 
 ## 验证方式
 
 - `cargo test -p tauritavern-server`；`cargo test --workspace --exclude tauritavern`（桌面 crate 需 GTK）。
-- `node --test tests/**/*.test.mjs`（含 `tests/server-route-bypass-contract.test.mjs`、`tests/chat-server-version-contract.test.mjs`）。
+- `node --experimental-vm-modules --test --test-concurrency=2 --test-timeout=120000 --test-force-exit 'tests/**/*.test.mjs'`（含浏览器、版本 CAS、后台恢复与路由契约）。
 - 隔离实例冒烟：新编译的 server 二进制 + 临时数据目录 + 假 provider（慢流、中途错误、群聊存读与版本冲突、备份下载、`../` handle 被拒）。资源目录需要 `default/` 与 `frontend-templates/`（参见 `Dockerfile`）。
+
+### 2.4 升级验收记录
+
+- 独立 `CARGO_TARGET_DIR`：服务器测试 43 项、改动的六个共享 crate 共 701 项通过；crate boundary 检查通过。未构建 GTK 桌面程序。
+- 完整 Node 测试 534 项：533 通过，1 项平台测试跳过；UI 测试 191 项通过；`pnpm run server:build` 的前端与 release server 构建通过。
+- 全新一次性数据目录、loopback 8013 与本地假 OpenAI provider 8014：HTTP 验证 bootstrap、设置读写、建角色、聊天保存/重读、swipe、旧版本 409、世界书、扩展存储、上传 staging、流式回复、后台断线重连和 ZIP 备份下载通过。
+- Chromium 实际页面验证登录启动、设置按钮、保存立即刷新、发送流式聊天、swipe 后保存与刷新、元数据保存、冷 swipe 设置，以及关闭页面后重新打开只恢复一次回复并清理 job 记录。
+- 明确禁用的 Channel 命令仅为 `subscribe_agent_run_live_projection`、`register_agent_extension_tool`、`set_agent_extension_tool_enabled`、`resolve_agent_extension_tool_call`；相关实时 Agent / in-app 工具界面显示服务器宿主不可用。无 Channel 的 Agent history/session/profile、MCP、SearXNG 与 vector 接共享服务。
+- 验证实例均已停止；未改生产数据、生产源码或生产进程。日志含提示词的测试仅使用虚构内容。

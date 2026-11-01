@@ -10,9 +10,6 @@ use tt_domain::models::character::Character;
 /// Repository interface for character management
 #[async_trait]
 pub trait CharacterRepository: Send + Sync {
-    /// Save a character to the repository
-    async fn save(&self, character: &Character) -> Result<(), DomainError>;
-
     /// Find a character by its file name (without extension)
     async fn find_by_name(&self, name: &str) -> Result<Character, DomainError>;
 
@@ -24,9 +21,6 @@ pub trait CharacterRepository: Send + Sync {
 
     /// Delete a character by its file name (without extension)
     async fn delete(&self, name: &str, delete_chats: bool) -> Result<(), DomainError>;
-
-    /// Update an existing character
-    async fn update(&self, character: &Character) -> Result<(), DomainError>;
 
     /// Persist raw character card JSON into the existing character file.
     async fn write_character_card_json(
@@ -55,16 +49,8 @@ pub trait CharacterRepository: Send + Sync {
         &self,
         file_path: &Path,
         name: &str,
-        primary_lorebook: Option<&str>,
+        primary_lorebook: &str,
     ) -> Result<Character, DomainError>;
-
-    /// Export a character card to a target path without mutating the stored source file.
-    async fn export_character(
-        &self,
-        name: &str,
-        target_path: &Path,
-        character_card_json: &str,
-    ) -> Result<(), DomainError>;
 
     /// Read the raw character card JSON payload as stored (PNG metadata, preferring V3 when available).
     async fn read_character_card_json(&self, name: &str) -> Result<String, DomainError>;
@@ -83,14 +69,6 @@ pub trait CharacterRepository: Send + Sync {
         avatar_path: Option<&Path>,
         crop: Option<ImageCrop>,
     ) -> Result<CharacterCreateResult, DomainError>;
-
-    /// Update a character's avatar
-    async fn update_avatar(
-        &self,
-        character: &Character,
-        avatar_path: &Path,
-        crop: Option<ImageCrop>,
-    ) -> Result<(), DomainError>;
 
     /// Get character chats
     async fn get_character_chats(

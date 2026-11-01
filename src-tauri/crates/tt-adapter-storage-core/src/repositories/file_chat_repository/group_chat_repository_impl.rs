@@ -27,12 +27,11 @@ impl GroupChatRepository for FileChatRepository {
         include_metadata: bool,
     ) -> Result<Vec<ChatSearchResult>, DomainError> {
         let descriptors = self.list_group_chat_files(chat_ids).await?;
-        let mut results = Vec::with_capacity(descriptors.len());
-        for descriptor in descriptors {
-            results.push(self.get_chat_summary(&descriptor, include_metadata).await?);
-        }
+        let mut results = self
+            .collect_chat_summaries(descriptors, include_metadata)
+            .await;
         results.sort_by_key(|result| Reverse(result.date));
-        self.flush_summary_index_if_needed().await?;
+        self.flush_summary_index_best_effort().await;
         Ok(results)
     }
 
@@ -57,12 +56,11 @@ impl GroupChatRepository for FileChatRepository {
             })
             .await?;
 
-        let mut results = Vec::with_capacity(selected.len());
-        for descriptor in selected {
-            results.push(self.get_chat_summary(&descriptor, include_metadata).await?);
-        }
+        let mut results = self
+            .collect_chat_summaries(selected, include_metadata)
+            .await;
         results.sort_by_key(|result| Reverse(result.date));
-        self.flush_summary_index_if_needed().await?;
+        self.flush_summary_index_best_effort().await;
         Ok(results)
     }
 
@@ -81,45 +79,21 @@ impl GroupChatRepository for FileChatRepository {
 
         let search_cache_key = Self::group_search_cache_key(&normalized_query, chat_ids);
         if let Some(cached) = self.get_cached_search_results(&search_cache_key).await {
-            return Ok(cached);
+            return Ok(cached.into_iter().map(ChatSearchResult::from).collect());
         }
 
         let descriptors = self.list_group_chat_files(chat_ids).await?;
-        let mut results = Vec::new();
-
-        for descriptor in descriptors {
-            let entry = self.get_chat_summary_entry(&descriptor, true).await?;
-            let mut summary = entry.summary.clone();
-            summary.chat_metadata = None;
-
-            let file_stem = strip_jsonl_extension(&descriptor.file_name);
-            if Self::file_stem_matches_all(file_stem, &fragments) {
-                results.push(summary);
-                continue;
-            }
-
-            if !entry
-                .fingerprint
-                .as_ref()
-                .expect("fingerprint is required for search")
-                .might_match_fragments(&fragments)
-            {
-                continue;
-            }
-
-            if self
-                .file_matches_query(&descriptor.path, file_stem, &fragments)
-                .await?
-            {
-                results.push(summary);
-            }
-        }
+        let (mut results, complete) = self
+            .collect_matching_chat_summaries(descriptors, &fragments)
+            .await;
 
         results.sort_by_key(|result| Reverse(result.date));
-        self.cache_search_results(search_cache_key, results.clone())
-            .await;
-        self.flush_summary_index_if_needed().await?;
-        Ok(results)
+        if complete {
+            self.cache_search_results(search_cache_key, results.clone())
+                .await;
+        }
+        self.flush_summary_index_best_effort().await;
+        Ok(results.into_iter().map(ChatSearchResult::from).collect())
     }
 
     async fn get_group_chat_payload_path(
@@ -139,7 +113,10 @@ impl GroupChatRepository for FileChatRepository {
 
     async fn get_group_chat_payload_bytes(&self, chat_id: &str) -> Result<Vec<u8>, DomainError> {
         let path = self.get_group_chat_payload_path(chat_id).await?;
-        self.read_payload_bytes_from_path(&path).await
+        fs::read(&path).await.map_err(|error| match error.kind() {
+            std::io::ErrorKind::NotFound => DomainError::NotFound(format!("Group chat not found: {chat_id}")),
+            _ => DomainError::InternalError(format!("Failed to read chat {}: {error}", path.display())),
+        })
     }
 
     async fn get_group_chat_payload_tail_lines(
@@ -192,7 +169,7 @@ impl GroupChatRepository for FileChatRepository {
             DomainError::InternalError(format!("Failed to delete group chat file: {}", e))
         })?;
         self.remove_summary_cache_for_path(&path).await;
-        self.flush_summary_index_if_needed().await?;
+        self.flush_summary_index_best_effort().await;
         Ok(())
     }
 
@@ -225,7 +202,7 @@ impl GroupChatRepository for FileChatRepository {
         move_file_no_replace_with_fallback(&old_path, &new_path).await?;
         self.remove_summary_cache_for_path(&old_path).await;
         self.remove_summary_cache_for_path(&new_path).await;
-        self.flush_summary_index_if_needed().await?;
+        self.flush_summary_index_best_effort().await;
 
         Ok(committed_file_name)
     }
@@ -263,17 +240,6 @@ impl GroupChatRepository for FileChatRepository {
     async fn get_group_chat_metadata(&self, chat_id: &str) -> Result<Value, DomainError> {
         let path = self.get_group_chat_path(chat_id)?;
         self.read_chat_metadata_from_path(&path).await
-    }
-
-    async fn set_group_chat_metadata_extension(
-        &self,
-        chat_id: &str,
-        namespace: &str,
-        value: Value,
-    ) -> Result<(), DomainError> {
-        let path = self.get_group_chat_path(chat_id)?;
-        self.set_chat_metadata_extension_in_path(&path, namespace, value)
-            .await
     }
 
     async fn get_group_chat_store_json(

@@ -1,2 +1,11 @@
-onlyBuiltDependencies:
-  - protobufjs
+# Keep the root explicit so pnpm's dependency checks see the whole workspace.
+packages:
+  - '.'
+  - 'packages/*'
+allowBuilds:
+  '@parcel/watcher': true
+  protobufjs: true
+enableGlobalVirtualStore: false
+minimumReleaseAge: 0
+overrides:
+  lodash-es: 4.18.1

@@ -22,6 +22,10 @@ const env = {
     TAURI_FRONTEND_PATH: repoRoot,
 };
 
+if (process.platform === "darwin") {
+    env.PATH = `${path.join(scriptDir, "macos")}${path.delimiter}${env.PATH}`;
+}
+
 const args = process.argv.slice(2);
 if (args[0] === "--") {
     args.shift();
@@ -29,22 +33,28 @@ if (args[0] === "--") {
 
 if (args[0] === "--prepare-frontend") {
     args.shift();
-    const frontendResult = spawnSync(process.execPath, [frontendBuildHook], {
-        cwd: repoRoot,
-        stdio: "inherit",
-        env,
-    });
-    if (frontendResult.error) {
-        console.error(frontendResult.error.message);
-        process.exit(1);
-    }
-    if (frontendResult.status !== 0) {
-        process.exit(frontendResult.status ?? 1);
+    const isDev = args[0] === "dev"
+        || (["android", "ios", "ohos"].includes(args[0]) && args[1] === "dev");
+    if (!isDev) {
+        const frontendResult = spawnSync(process.execPath, [frontendBuildHook], {
+            cwd: repoRoot,
+            stdio: "inherit",
+            env,
+        });
+        if (frontendResult.error) {
+            console.error(frontendResult.error.message);
+            process.exit(1);
+        }
+        if (frontendResult.status !== 0) {
+            process.exit(frontendResult.status ?? 1);
+        }
     }
     env.TAURITAVERN_SKIP_WEB_BUILD = "1";
 }
 
-const result = spawnSync(process.execPath, [tauriCli, ...args], {
+// OpenHarmony uses the toolchain's cargo-tauri; the npm CLI has no ohos command.
+const result = spawnSync(args[0] === "ohos" ? "cargo" : process.execPath,
+    args[0] === "ohos" ? ["tauri", ...args] : [tauriCli, ...args], {
     cwd: repoRoot,
     stdio: "inherit",
     env,

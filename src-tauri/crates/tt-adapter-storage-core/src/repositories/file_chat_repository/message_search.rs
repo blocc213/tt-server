@@ -4,11 +4,14 @@ use std::collections::{BinaryHeap, HashSet};
 use serde::Deserialize;
 
 use tt_domain::errors::DomainError;
+use tt_domain::frozen_macros::{FrozenMacros, MAX_EXPANDED_TEXT_BYTES};
+use tt_domain::text_search::normalize_search_query;
 use tt_ports::repositories::chat_repository::{
     ChatMessageRole, ChatMessageSearchFilters, ChatMessageSearchHit, ChatMessageSearchQuery,
 };
 
 use super::{FileChatRepository, classify_message_role};
+use crate::chat_jsonl::trim_whitespace;
 
 const MAX_QUERY_TOKENS: usize = 64;
 const MAX_BIGRAM_TOKENS_PER_SEGMENT: usize = 32;
@@ -30,24 +33,6 @@ struct SearchableChatMessage {
 
 fn role_from_message(message: &SearchableChatMessage) -> ChatMessageRole {
     classify_message_role(message.role.as_deref(), message.is_user, message.is_system)
-}
-
-fn normalize_query(value: &str) -> String {
-    value
-        .trim()
-        .to_lowercase()
-        .chars()
-        .map(|ch| {
-            if ch.is_alphanumeric() || ch == '_' {
-                ch
-            } else {
-                ' '
-            }
-        })
-        .collect::<String>()
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
 }
 
 fn bigram_tokens(value: &str, limit: usize) -> Vec<String> {
@@ -74,6 +59,10 @@ fn bigram_tokens(value: &str, limit: usize) -> Vec<String> {
     tokens
 }
 
+fn has_word_chars(value: &str) -> bool {
+    value.chars().any(|ch| ch.is_alphanumeric() || ch == '_')
+}
+
 fn expand_query_tokens(tokens: Vec<String>) -> Vec<String> {
     if tokens.is_empty() {
         return Vec::new();
@@ -82,7 +71,7 @@ fn expand_query_tokens(tokens: Vec<String>) -> Vec<String> {
     if tokens.len() == 1 {
         let token = &tokens[0];
         let char_count = token.chars().count();
-        if char_count <= 2 {
+        if char_count <= 2 || !has_word_chars(token) {
             return tokens;
         }
 
@@ -97,7 +86,7 @@ fn expand_query_tokens(tokens: Vec<String>) -> Vec<String> {
     for token in tokens {
         let char_count = token.chars().count();
         let is_ascii_word = token.chars().any(|ch| ch.is_ascii_alphanumeric());
-        if !is_ascii_word && char_count >= 8 {
+        if has_word_chars(&token) && !is_ascii_word && char_count >= 8 {
             expanded.extend(bigram_tokens(&token, 8));
         } else {
             expanded.push(token);
@@ -132,7 +121,7 @@ fn dedup_and_limit_tokens(tokens: Vec<String>) -> Vec<String> {
 }
 
 fn build_query_tokens(query: &str) -> Vec<String> {
-    let normalized = normalize_query(query);
+    let normalized = normalize_search_query(query);
     if normalized.is_empty() {
         return Vec::new();
     }
@@ -242,6 +231,7 @@ struct Candidate {
 }
 
 struct CandidateSearchPlan {
+    frozen_macros: Option<std::sync::Arc<FrozenMacros>>,
     min_index: usize,
     max_index: usize,
     role_filter: Option<ChatMessageRole>,
@@ -340,6 +330,7 @@ impl FileChatRepository {
 
         let mut remaining_scan = resolve_scan_limit(total_count, filters)?;
         let plan = CandidateSearchPlan {
+            frozen_macros: query.frozen_macros,
             min_index: start_index,
             max_index: end_index,
             role_filter,
@@ -427,6 +418,7 @@ impl FileChatRepository {
 
         let mut remaining_scan = resolve_scan_limit(total_count, filters)?;
         let plan = CandidateSearchPlan {
+            frozen_macros: query.frozen_macros,
             min_index: start_index,
             max_index: end_index,
             role_filter,
@@ -489,7 +481,12 @@ fn collect_candidates_from_lines(
             continue;
         }
 
-        let message: SearchableChatMessage = serde_json::from_str(line).map_err(|error| {
+        if !trim_whitespace(line.as_bytes()).starts_with(b"{") {
+            return Err(DomainError::InvalidData(format!(
+                "Chat message {index} must be a JSON object"
+            )));
+        }
+        let mut message: SearchableChatMessage = serde_json::from_str(line).map_err(|error| {
             DomainError::InvalidData(format!("Failed to parse chat message JSON: {}", error))
         })?;
 
@@ -500,6 +497,12 @@ fn collect_candidates_from_lines(
             continue;
         }
 
+        if let Some(macros) = &plan.frozen_macros
+            && let std::borrow::Cow::Owned(text) =
+                macros.render(&message.mes, MAX_EXPANDED_TEXT_BYTES)?
+        {
+            message.mes = text;
+        }
         let (score, match_byte) = score_text(&message.mes, &plan.tokens, plan.needs_lowercase);
         if score <= 0.0 {
             continue;
@@ -541,4 +544,23 @@ fn finalize_candidates(heap: BinaryHeap<Reverse<Candidate>>) -> Vec<ChatMessageS
             text: candidate.text,
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{build_query_tokens, score_text};
+
+    #[test]
+    fn punctuation_and_symbol_only_queries_match_literally() {
+        for (query, text) in [
+            ("——", "pause——continue"),
+            ("❤️", "status: ❤️"),
+            ("👨‍👩‍👧", "family: 👨‍👩‍👧"),
+        ] {
+            let tokens = build_query_tokens(query);
+
+            assert_eq!(tokens, vec![query]);
+            assert_eq!(score_text(text, &tokens, false), (1.0, text.find(query)));
+        }
+    }
 }

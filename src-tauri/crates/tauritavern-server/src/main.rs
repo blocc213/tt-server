@@ -6,12 +6,16 @@
 mod archive;
 mod auth;
 mod background;
+mod browser_resources;
+mod rpc_bytes;
+mod rpc_services;
 mod chat;
 mod composition;
 mod config;
 mod error;
 mod generate;
 mod http;
+mod llm_logging;
 mod product;
 mod resource;
 mod resources;
@@ -23,8 +27,8 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use clap::Parser;
-use rand::RngCore;
-use tt_adapter_storage_core::FileSettingsRepository;
+use rand::Rng;
+use tt_adapter_storage_core::load_tauritavern_settings_blocking;
 
 use crate::auth::Auth;
 use crate::config::Args;
@@ -51,8 +55,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Startup settings come from the same file the app uses, so a data root can
     // move between the app and the server without reconfiguration.
-    let settings_repository = FileSettingsRepository::new(args.data_dir.join("default-user"));
-    let settings = settings_repository.load_tauritavern_settings_sync()?;
+    let settings = load_tauritavern_settings_blocking(&args.data_dir.join("default-user"), &Default::default())?;
     settings
         .chat_backups
         .validate()
@@ -77,6 +80,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         frontend_dir: args.frontend_dir.clone(),
         csrf_token: random_token(),
         upload_staging: Arc::new(upload::UploadStaging::new(&args.data_dir)),
+        browser_resources: Default::default(),
+        templates: Default::default(),
     });
 
     // Same background loops the app host starts: chat history persistence and

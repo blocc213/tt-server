@@ -38,7 +38,9 @@ user-error layer 将消息交给 `app/backend_errors.rs::BackendErrorHub`。前�
 
 Dev Observability 通过 `app/dev_observability.rs::DevObservabilityHub` 暴露给 presentation commands。`dev_logging_commands.rs` 和 `settings_commands.rs` 不直接接触 `infrastructure::logging::*` store。
 
-LLM API logs 仍由 infrastructure decorator `LoggingChatCompletionRepository` 记录 raw/readable 请求响应。持久化失败是诊断日志，不触发 backend error toast。
+LLM API logs 由 infrastructure decorator `LoggingChatCompletionRepository` 记录 raw/readable 请求响应。JSON 请求及非流式 JSON 响应写入前会移除内部 provider state，并把 base64 data URL，以及同一对象内同时带非空字符串 `data` 和媒体类型（`media_type`、`mime_type` 或 `mimeType`）的内联媒体，替换为只含 MIME 与编码长度的占位符；脱敏只作用于日志副本，不修改出站 payload。持久化失败是诊断日志，不触发 backend error toast。
+
+`tauritavern-server` wraps the shared chat completion repository with `src-tauri/crates/tauritavern-server/src/llm_logging.rs`. At `info`, target `tauritavern_server::llm` prints full pretty-JSON provider requests and non-stream responses; stream completion includes duration and chunk count. Failed browser generate requests (stream, non-stream, and background), including application-layer rejections, also dump the original payload at `info`; failures after repository entry may therefore print both browser and provider requests. Failures are logged at `error`. This covers foreground, background, and agent calls. Credentials in API configuration, credential-named body fields, and the entire browser `custom_include_headers` field are redacted; prompts/responses remain sensitive and are not truncated. Set `RUST_LOG=info,tauritavern_server::llm=off` to disable these dumps. Docker deployments must rebuild the image and use `sudo docker compose logs -f` to view them.
 
 ## 5. 持续开发守卫
 

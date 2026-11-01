@@ -6,19 +6,16 @@ use async_trait::async_trait;
 use serde_json::Value;
 use tokio::fs;
 
-use crate::chat_format_importers::{
-    export_payload_to_plain_text, import_chat_jsonl_bytes, import_chat_payloads_from_json,
-};
+use crate::chat_format_importers::{import_chat_jsonl_bytes, import_chat_payloads_from_json};
+use crate::chat_jsonl::{read_payload, write_payload, write_payload_bytes};
 use crate::file_system::{list_files_with_extension, move_file_no_replace_with_fallback};
-use crate::jsonl_utils::{
-    parse_jsonl_bytes, read_jsonl_file, write_jsonl_bytes_file, write_jsonl_file,
-};
 use tt_domain::errors::DomainError;
 use tt_domain::models::chat::{Chat, ChatMessage, strip_jsonl_extension};
 use tt_ports::repositories::chat_repository::{
-    ChatExportFormat, ChatImportFormat, ChatMessageSearchHit, ChatMessageSearchQuery,
-    ChatMessagesReadResult, ChatPayloadChunk, ChatPayloadCursor, ChatPayloadTail, ChatRepository,
-    ChatSearchResult, FindLastMessageQuery, LocatedChatMessage, PinnedCharacterChat,
+    CharacterChatIdentity, ChatBackupCatalogEntry, ChatImportFormat, ChatMessageSearchHit,
+    ChatMessageSearchQuery, ChatMessagesReadResult, ChatPayloadChunk, ChatPayloadCursor,
+    ChatPayloadTail, ChatRepository, ChatSearchResult, FindLastMessageQuery, LocatedChatMessage,
+    PinnedCharacterChat,
 };
 
 use super::FileChatRepository;
@@ -142,7 +139,7 @@ impl ChatRepository for FileChatRepository {
                     .unwrap_or("")
                     .to_string();
 
-                let payload = read_jsonl_file(&path).await?;
+                let payload = read_payload(&path).await?;
                 let chat = self.parse_chat_from_payload("", &file_name, &payload)?;
                 all_chats.push(chat);
             }
@@ -185,7 +182,7 @@ impl ChatRepository for FileChatRepository {
             cache.remove(&cache_key);
         }
         self.remove_summary_cache_for_path(&path).await;
-        self.flush_summary_index_if_needed().await?;
+        self.flush_summary_index_best_effort().await;
 
         Ok(())
     }
@@ -252,7 +249,7 @@ impl ChatRepository for FileChatRepository {
         }
         self.remove_summary_cache_for_path(&old_path).await;
         self.remove_summary_cache_for_path(&new_path).await;
-        self.flush_summary_index_if_needed().await?;
+        self.flush_summary_index_best_effort().await;
 
         Ok(committed_file_name)
     }
@@ -293,45 +290,21 @@ impl ChatRepository for FileChatRepository {
         let search_cache_key =
             Self::character_search_cache_key(&normalized_query, character_filter);
         if let Some(cached) = self.get_cached_search_results(&search_cache_key).await {
-            return Ok(cached);
+            return Ok(cached.into_iter().map(ChatSearchResult::from).collect());
         }
 
         let descriptors = self.list_character_chat_files(character_filter).await?;
-        let mut results = Vec::new();
-
-        for descriptor in descriptors {
-            let entry = self.get_chat_summary_entry(&descriptor, true).await?;
-            let mut summary = entry.summary.clone();
-            summary.chat_metadata = None;
-
-            let file_stem = strip_jsonl_extension(&descriptor.file_name);
-            if Self::file_stem_matches_all(file_stem, &fragments) {
-                results.push(summary);
-                continue;
-            }
-
-            if !entry
-                .fingerprint
-                .as_ref()
-                .expect("fingerprint is required for search")
-                .might_match_fragments(&fragments)
-            {
-                continue;
-            }
-
-            if self
-                .file_matches_query(&descriptor.path, file_stem, &fragments)
-                .await?
-            {
-                results.push(summary);
-            }
-        }
+        let (mut results, complete) = self
+            .collect_matching_chat_summaries(descriptors, &fragments)
+            .await;
 
         results.sort_by_key(|result| Reverse(result.date));
-        self.cache_search_results(search_cache_key, results.clone())
-            .await;
-        self.flush_summary_index_if_needed().await?;
-        Ok(results)
+        if complete {
+            self.cache_search_results(search_cache_key, results.clone())
+                .await;
+        }
+        self.flush_summary_index_best_effort().await;
+        Ok(results.into_iter().map(ChatSearchResult::from).collect())
     }
 
     async fn list_chat_summaries(
@@ -340,12 +313,11 @@ impl ChatRepository for FileChatRepository {
         include_metadata: bool,
     ) -> Result<Vec<ChatSearchResult>, DomainError> {
         let descriptors = self.list_character_chat_files(character_filter).await?;
-        let mut results = Vec::with_capacity(descriptors.len());
-        for descriptor in descriptors {
-            results.push(self.get_chat_summary(&descriptor, include_metadata).await?);
-        }
+        let mut results = self
+            .collect_chat_summaries(descriptors, include_metadata)
+            .await;
         results.sort_by_key(|result| Reverse(result.date));
-        self.flush_summary_index_if_needed().await?;
+        self.flush_summary_index_best_effort().await;
         Ok(results)
     }
 
@@ -375,12 +347,11 @@ impl ChatRepository for FileChatRepository {
             })
             .await?;
 
-        let mut results = Vec::with_capacity(selected.len());
-        for descriptor in selected {
-            results.push(self.get_chat_summary(&descriptor, include_metadata).await?);
-        }
+        let mut results = self
+            .collect_chat_summaries(selected, include_metadata)
+            .await;
         results.sort_by_key(|result| Reverse(result.date));
-        self.flush_summary_index_if_needed().await?;
+        self.flush_summary_index_best_effort().await;
         Ok(results)
     }
 
@@ -417,53 +388,6 @@ impl ChatRepository for FileChatRepository {
 
         self.get_chat(character_name, strip_jsonl_extension(first))
             .await
-    }
-
-    async fn export_chat(
-        &self,
-        character_name: &str,
-        file_name: &str,
-        target_path: &Path,
-        format: ChatExportFormat,
-    ) -> Result<(), DomainError> {
-        tracing::debug!(
-            "Exporting chat: {}/{} to {:?}",
-            character_name,
-            file_name,
-            target_path
-        );
-
-        match format {
-            ChatExportFormat::JSONL => {
-                let candidate_path = self
-                    .resolve_character_chat_path(character_name, file_name)
-                    .await?;
-                let chat_path = if candidate_path.exists() {
-                    candidate_path
-                } else {
-                    self.chats_dir
-                        .join(Self::normalize_jsonl_file_name(file_name)?)
-                };
-
-                // Copy the file
-                fs::copy(&chat_path, target_path).await.map_err(|e| {
-                    tracing::error!("Failed to export chat: {}", e);
-                    DomainError::InternalError(format!("Failed to export chat: {}", e))
-                })?;
-            }
-            ChatExportFormat::PlainText => {
-                let payload = self.get_chat_payload(character_name, file_name).await?;
-                let text = export_payload_to_plain_text(&payload);
-
-                // Write the file
-                fs::write(target_path, text).await.map_err(|e| {
-                    tracing::error!("Failed to write export file: {}", e);
-                    DomainError::InternalError(format!("Failed to write export file: {}", e))
-                })?;
-            }
-        }
-
-        Ok(())
     }
 
     async fn backup_chat(&self, character_name: &str, file_name: &str) -> Result<(), DomainError> {
@@ -508,16 +432,16 @@ impl ChatRepository for FileChatRepository {
     }
 
     async fn list_chat_backups(&self) -> Result<Vec<ChatSearchResult>, DomainError> {
-        let descriptors = self.list_chat_backup_files().await?;
-        let mut results = Vec::with_capacity(descriptors.len());
+        let entries = self.list_chat_backup_entries().await?;
+        let mut results = Vec::with_capacity(entries.len());
 
-        for descriptor in descriptors {
-            match self.get_chat_summary(&descriptor, false).await {
+        for entry in entries {
+            match self.get_chat_backup_summary(&entry).await {
                 Ok(summary) => results.push(summary),
                 Err(error) => {
                     tracing::warn!(
                         "Failed to read chat backup summary {:?}: {}",
-                        descriptor.path,
+                        self.backups_dir.join(entry.file_name),
                         error
                     );
                 }
@@ -525,19 +449,19 @@ impl ChatRepository for FileChatRepository {
         }
 
         results.sort_by_key(|result| Reverse(result.date));
-        self.flush_summary_index_if_needed().await?;
+        self.schedule_backup_summary_index_flush();
         Ok(results)
     }
 
-    async fn materialize_chat_backup(
-        &self,
-        backup_file_name: &str,
-    ) -> Result<std::path::PathBuf, DomainError> {
-        self.materialize_chat_backup_file(backup_file_name).await
+    async fn list_chat_backup_catalog(&self) -> Result<Vec<ChatBackupCatalogEntry>, DomainError> {
+        self.list_chat_backup_catalog_entries().await
     }
 
-    async fn discard_chat_backup_materialization(&self, path: &Path) -> Result<(), DomainError> {
-        self.discard_chat_backup_materialization_file(path).await
+    async fn open_chat_backup_download(
+        &self,
+        backup_file_name: &str,
+    ) -> Result<Box<dyn tt_ports::byte_reader::ByteReader>, DomainError> {
+        self.open_chat_backup_download_file(backup_file_name).await
     }
 
     async fn restore_character_chat_backup(
@@ -564,10 +488,10 @@ impl ChatRepository for FileChatRepository {
         character_name: &str,
         file_name: &str,
     ) -> Result<Vec<Value>, DomainError> {
-        let bytes = self
-            .get_chat_payload_bytes(character_name, file_name)
+        let path = self
+            .resolve_character_chat_path(character_name, file_name)
             .await?;
-        parse_jsonl_bytes(&bytes)
+        read_payload(&path).await
     }
 
     async fn get_chat_payload_bytes(
@@ -578,14 +502,15 @@ impl ChatRepository for FileChatRepository {
         let path = self
             .resolve_character_chat_path(character_name, file_name)
             .await?;
-        if !path.exists() {
-            return Err(DomainError::NotFound(format!(
-                "Chat not found: {}/{}",
-                character_name, file_name
-            )));
-        }
-
-        self.read_payload_bytes_from_path(&path).await
+        fs::read(&path).await.map_err(|error| match error.kind() {
+            std::io::ErrorKind::NotFound => {
+                DomainError::NotFound(format!("Chat not found: {}/{}", character_name, file_name))
+            }
+            _ => DomainError::InternalError(format!(
+                "Failed to read chat {}: {error}",
+                path.display()
+            )),
+        })
     }
 
     async fn get_chat_payload_path(
@@ -683,7 +608,7 @@ impl ChatRepository for FileChatRepository {
                 let file_stem =
                     self.next_import_chat_file_stem_in_dir(&dir_key, character_display_name, 0)?;
                 let path = self.get_chat_path_for_dir_key(&dir_key, &file_stem)?;
-                write_jsonl_bytes_file(&path, &payload_bytes).await?;
+                write_payload_bytes(&path, &payload_bytes).await?;
                 self.remove_summary_cache_for_path(&path).await;
                 return Ok(vec![Self::normalize_jsonl_file_name(&file_stem)?]);
             }
@@ -695,7 +620,7 @@ impl ChatRepository for FileChatRepository {
             let file_stem =
                 self.next_import_chat_file_stem_in_dir(&dir_key, character_display_name, index)?;
             let path = self.get_chat_path_for_dir_key(&dir_key, &file_stem)?;
-            write_jsonl_file(&path, payload).await?;
+            write_payload(&path, payload).await?;
             self.remove_summary_cache_for_path(&path).await;
             created_files.push(Self::normalize_jsonl_file_name(&file_stem)?);
         }
@@ -724,18 +649,47 @@ impl ChatRepository for FileChatRepository {
         self.read_chat_metadata_from_path(&path).await
     }
 
-    async fn set_character_chat_metadata_extension(
+    async fn get_character_chat_integrity(
         &self,
         character_name: &str,
         file_name: &str,
-        namespace: &str,
-        value: Value,
-    ) -> Result<(), DomainError> {
+    ) -> Result<Option<String>, DomainError> {
         let path = self
             .resolve_character_chat_path(character_name, file_name)
             .await?;
-        self.set_chat_metadata_extension_in_path(&path, namespace, value)
-            .await
+        self.read_chat_integrity_from_path(&path).await
+    }
+
+    async fn list_character_chat_identities(
+        &self,
+        character_name: &str,
+    ) -> Result<Vec<CharacterChatIdentity>, DomainError> {
+        let mut identities = Vec::new();
+        for chat in self.list_character_chat_files(Some(character_name)).await? {
+            identities.push(CharacterChatIdentity {
+                file_name: chat.file_name,
+                integrity: self.read_chat_integrity_from_path(&chat.path).await?,
+            });
+        }
+        Ok(identities)
+    }
+
+    async fn has_character_chat_with_integrity(
+        &self,
+        character_name: &str,
+        integrity: &str,
+    ) -> Result<bool, DomainError> {
+        for chat in self.list_character_chat_files(Some(character_name)).await? {
+            if self
+                .read_chat_integrity_from_path(&chat.path)
+                .await?
+                .as_deref()
+                == Some(integrity)
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     async fn get_character_chat_store_json(

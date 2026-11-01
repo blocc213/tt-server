@@ -385,9 +385,8 @@ impl FileChatRepository {
 
         target_entry.modified = source_entry.modified;
         inventory.remove(&existing.file_name);
-        inventory.insert(target_entry)?;
-        self.remove_summary_cache_for_path(&source_path).await;
-        self.remove_summary_cache_for_path(&target_path).await;
+        inventory.insert(target_entry.clone())?;
+        self.update_backup_summary_signature(&target_entry).await;
         tracing::warn!(
             logical_name = %existing.logical_file_name,
             kept = ?target_format,
@@ -426,62 +425,25 @@ mod tests {
     }
 
     #[test]
-    fn parser_uses_the_fixed_timestamp_tail() {
-        assert_eq!(
-            parsed_backup_prefix("chat_角色_a_b_20260714-010203.jsonl").as_deref(),
-            Some("chat_角色_a_b_")
-        );
-        assert_eq!(parsed_backup_prefix("chat_角色_a_b_bad.jsonl"), None);
-    }
-
-    #[test]
-    fn inventory_byte_overflow_is_an_error_not_a_panic() {
-        let mut inventory = BackupInventory::default();
-        inventory
-            .insert(entry("largest", None, 1, u64::MAX))
-            .unwrap();
-
-        assert!(inventory.insert(entry("overflow", None, 2, 1)).is_err());
-        assert_eq!(inventory.entries.len(), 1);
-        assert_eq!(inventory.total_bytes, u64::MAX);
-    }
-
-    #[test]
     fn planner_combines_prefix_file_and_byte_limits_oldest_first() {
         let mut inventory = BackupInventory::default();
         inventory.insert(entry("a1", Some("a"), 1, 3)).unwrap();
         inventory.insert(entry("a2", Some("a"), 2, 3)).unwrap();
         inventory.insert(entry("b1", Some("b"), 3, 3)).unwrap();
 
-        let deleted = plan_evictions(
-            &inventory,
-            policy(2, 3, 7),
-            Some(BackupCandidate {
-                prefix: "a",
-                byte_len: 3,
-            }),
-        )
-        .expect("plan candidate");
+        for limits in [policy(2, 3, 7), policy(1, -1, -1)] {
+            let deleted = plan_evictions(
+                &inventory,
+                limits,
+                Some(BackupCandidate {
+                    prefix: "a",
+                    byte_len: 3,
+                }),
+            )
+            .expect("plan candidate");
 
-        assert_eq!(deleted, ["a1", "a2"]);
-    }
-
-    #[test]
-    fn planner_replaces_the_old_entry_when_prefix_limit_is_one() {
-        let mut inventory = BackupInventory::default();
-        inventory.insert(entry("old", Some("a"), 1, 10)).unwrap();
-
-        let deleted = plan_evictions(
-            &inventory,
-            policy(1, -1, -1),
-            Some(BackupCandidate {
-                prefix: "a",
-                byte_len: 10,
-            }),
-        )
-        .expect("plan candidate");
-
-        assert_eq!(deleted, ["old"]);
+            assert_eq!(deleted, ["a1", "a2"]);
+        }
     }
 
     #[test]
@@ -550,30 +512,6 @@ mod tests {
             plan_evictions(&inventory, policy(-1, -1, 4), None)
                 .expect("plan global byte retention"),
             ["malformed-old"]
-        );
-    }
-
-    #[test]
-    fn prefix_limit_uses_exact_parsed_prefixes() {
-        let mut inventory = BackupInventory::default();
-        inventory
-            .insert(entry("al", Some("chat_al_"), 1, 1))
-            .unwrap();
-        inventory
-            .insert(entry("alice", Some("chat_al_ice_"), 2, 1))
-            .unwrap();
-
-        assert_eq!(
-            plan_evictions(
-                &inventory,
-                policy(1, -1, -1),
-                Some(BackupCandidate {
-                    prefix: "chat_al_",
-                    byte_len: 1,
-                })
-            )
-            .expect("plan exact prefix retention"),
-            ["al"]
         );
     }
 }

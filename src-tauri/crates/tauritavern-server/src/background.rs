@@ -39,6 +39,10 @@ impl Job {
         self.state.send_modify(|state| state.done = true);
     }
 
+    pub fn event_count(&self) -> usize {
+        self.state.borrow().events.len()
+    }
+
     /// Waits for completion and returns the single payload of a
     /// non-streaming job.
     pub async fn result(&self) -> String {
@@ -161,5 +165,41 @@ mod tests {
         job.finish();
         assert_eq!(waiter.await.unwrap(), "{\"ok\":true}");
         remove("test-result");
+    }
+
+    #[tokio::test]
+    async fn producer_continues_after_replay_consumer_is_dropped() {
+        let (job, created) = get_or_insert("test-dropped-consumer", true);
+        assert!(created);
+
+        // Open replay(0) and immediately drop the consumer stream.
+        let consumer = job.replay(0);
+        drop(consumer);
+
+        // Producer pushes events and finishes.
+        job.push("chunk-1".into());
+        job.push("chunk-2".into());
+        job.finish();
+
+        // New replay(0) returns all events and terminates.
+        let events = ids_and_data(&job, 0).await;
+        assert_eq!(events.len(), 2);
+        assert!(events[0].contains("id: 0") && events[0].contains("data: chunk-1"));
+        assert!(events[1].contains("id: 1") && events[1].contains("data: chunk-2"));
+
+        remove("test-dropped-consumer");
+    }
+
+    #[test]
+    fn get_or_insert_idempotent_returns_same_arc_and_created_false() {
+        let id = "test-idempotent-get-or-insert";
+        let (job1, created1) = get_or_insert(id, true);
+        assert!(created1);
+
+        let (job2, created2) = get_or_insert(id, true);
+        assert!(!created2);
+        assert!(Arc::ptr_eq(&job1, &job2));
+
+        remove(id);
     }
 }

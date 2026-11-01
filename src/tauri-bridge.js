@@ -1,45 +1,11 @@
 // Core Tauri bridge for frontend modules.
 
-import { SILLYTAVERN_COMPAT_VERSION } from './compat-version.js';
-
-function detectTauriEnv() {
-    if (typeof window === 'undefined') {
-        return false;
-    }
-
-    // __TAURI_RUNNING__ is set in init.js before dynamic imports to avoid
-    // startup races where mobile bridge internals are injected a bit later.
-    return window.__TAURI_RUNNING__ === true
-        || window.__TAURI_INTERNALS__ !== undefined
-        || typeof window.__TAURI__?.core?.invoke === 'function';
-}
-
-/// True when the page is served over HTTP by tauritavern-server.
-function detectServerEnv() {
-    return typeof window !== 'undefined' && window.__TAURITAVERN_SERVER__ === true;
-}
-
-export const isTauriEnv = detectTauriEnv();
-
-/// True when the page is served over HTTP by tauritavern-server.
-///
-/// A function, not a constant: init.js assigns the flag during bootstrap, so a
-/// value captured at module-evaluation time can be read too early.
-export function isServerEnv() {
-    return detectServerEnv();
-}
-
 function getTauri() {
     if (typeof window === 'undefined') {
         return null;
     }
 
     return window.__TAURI__ || null;
-}
-
-function getInvokeFn() {
-    const fn = getTauri()?.core?.invoke;
-    return typeof fn === 'function' ? fn : null;
 }
 
 function isPlainObject(value) {
@@ -70,124 +36,95 @@ function withTauriArgumentAliases(args) {
     return aliased;
 }
 
-function toCamelCaseArgs(args) {
-    const camel = {};
-    for (const [key, value] of Object.entries(args)) {
-        const camelCaseKey = key.replace(/_+([a-zA-Z0-9])/g, (_, char) => char.toUpperCase());
-        // An explicit camelCase key wins over its snake_case twin, matching
-        // withTauriArgumentAliases.
-        if (camelCaseKey === key || !Object.prototype.hasOwnProperty.call(args, camelCaseKey)) {
-            camel[camelCaseKey] = value;
-        }
-    }
-    return camel;
+export function isServerEnv() {
+    return globalThis.__TAURITAVERN_HOST__?.kind === 'server'
+        || globalThis.__TAURITAVERN_SERVER__ === true
+        || globalThis.window?.__TAURITAVERN_SERVER__ === true;
 }
 
-/// Status -> the message prefix `resolveHostErrorResponse` parses back.
-///
-/// Mirrors `CommandError`'s `#[error("...")]` strings so the in-page router
-/// produces the same status under both hosts. Already-prefixed messages pass
-/// through untouched: the server's own text sometimes carries it.
-const ERROR_CATEGORY_PREFIXES = Object.freeze({
-    400: 'Bad request',
-    401: 'Unauthorized',
-    403: 'Permission denied',
-    404: 'Not found',
-    409: 'Conflict',
-    413: 'Payload too large',
-    429: 'Too many requests',
-});
+export function isTauri() { return typeof getTauri()?.core?.invoke === 'function' && !isServerEnv(); }
+export function hasBackend() { return isTauri() || isServerEnv(); }
 
-function prefixErrorCategory(status, message) {
-    const prefix = ERROR_CATEGORY_PREFIXES[status];
-    if (!prefix) {
-        return message;
+const loadedChatVersions = new Map();
+const chatCommitTargets = new Map();
+const serverResources = new Set();
+let clientId;
+const targetKey = target => target.kind === 'group' ? `group:${target.chatId}` : `character:${target.characterId}/${target.fileName}`;
+
+async function invokeHttp(command, args, options = {}) {
+    clientId ??= Array.from(crypto.getRandomValues(new Uint8Array(16)), byte => byte.toString(16).padStart(2, '0')).join('');
+    if (command === 'plugin:resources|close') command = 'close_resource';
+    if (['subscribe_agent_run_live_projection', 'register_agent_extension_tool', 'set_agent_extension_tool_enabled', 'resolve_agent_extension_tool_call'].includes(command)) {
+        throw new Error('Agent live projection and browser extension tools are not available on server host; use a native host.');
     }
-
-    const lower = message.toLowerCase();
-    for (const candidate of Object.values(ERROR_CATEGORY_PREFIXES)) {
-        if (lower.startsWith(`${candidate.toLowerCase()}:`)) {
-            return message;
-        }
+    if (command === 'begin_chat_commit') {
+        const version = loadedChatVersions.get(targetKey(args.target)) ?? null;
+        args = { ...args, version, isNew: !version, force: args.operation?.force === true };
     }
-
-    return `${prefix}: ${message}`;
-}
-
-/// Calls a backend command over HTTP in server mode.
-///
-/// The server exposes an explicit allowlist, so an unknown command answers 404
-/// and surfaces here as a normal error instead of hanging.
-async function invokeOverHttp(command, args, options) {
-    const rawBody = args instanceof Uint8Array || args instanceof ArrayBuffer;
-    const url = rawBody
-        ? `/rpc-raw/${encodeURIComponent(command)}`
-        : `/rpc/${encodeURIComponent(command)}`;
-    const headers = rawBody
-        ? { ...(options?.headers || {}) }
-        : { 'Content-Type': 'application/json' };
-    const response = await fetch(url, {
-        method: 'POST',
-        headers,
-        cache: 'no-store',
-        body: rawBody ? args : JSON.stringify(args ?? {}),
+    const raw = args instanceof ArrayBuffer || ArrayBuffer.isView(args);
+    const headers = new Headers(options.headers);
+    headers.set('x-tauritavern-client-id', clientId);
+    headers.set('Content-Type', raw ? 'application/octet-stream' : 'application/json');
+    const response = await fetch(`${raw ? '/rpc-raw/' : '/rpc/'}${encodeURIComponent(command)}`, {
+        method: 'POST', credentials: 'same-origin', headers,
+        body: raw ? args : JSON.stringify(withTauriArgumentAliases(args ?? {})),
+        signal: options.signal,
     });
-
-    const text = await response.text();
-
     if (!response.ok) {
-        // Error bodies are not always JSON: axum's extractor rejections (413
-        // body limit, 400 parse errors) answer plain text. Parsing them as JSON
-        // replaced the real status with a SyntaxError and every such failure
-        // surfaced as a generic 500.
-        let message;
-        try {
-            message = JSON.parse(text)?.error;
-        } catch {
-            message = text.trim().slice(0, 500);
-        }
-        message ||= `Command failed: ${command}`;
-
-        // Re-apply the category prefix the Tauri host's `CommandError` Display
-        // emits (`presentation/errors.rs`). The server carries the category in
-        // the HTTP status instead, and the in-page router maps errors back to
-        // statuses by parsing that prefix
-        // (`tauri/main/kernel/host-error-response.js:resolveHostErrorResponse`).
-        // Without it every server-mode failure collapsed to 500, so callers that
-        // key off a specific status -- the settings 409 conflict prompt, the
-        // 404-tolerant delete paths -- never saw it.
-        throw new Error(prefixErrorCategory(response.status, message));
+        const text = await response.text();
+        let payload;
+        try { payload = JSON.parse(text); } catch { payload = null; }
+        const error = new Error(payload?.message || payload?.error || text || response.statusText);
+        Object.assign(error, { status: response.status, payload });
+        if (response.status === 409 && command.includes('chat_commit')) error.code = 'integrity';
+        throw error;
     }
-
-    return text ? JSON.parse(text) : null;
+    if (response.headers.get('content-type')?.includes('application/octet-stream')) {
+        const bytes = await response.arrayBuffer();
+        if (command === 'read_bytes' && bytes.byteLength === 0) serverResources.delete(args.rid);
+        return bytes;
+    }
+    const result = response.status === 204 ? undefined : await response.json();
+    if (command === 'open_cold_chat' || command === 'open_chat_payload_json') {
+        const header = response.headers.get('x-tauritavern-chat-version');
+        loadedChatVersions.set(targetKey(args.target), header ? JSON.parse(header) : result?.version ?? null);
+    }
+    if (command === 'begin_chat_commit') chatCommitTargets.set(result.sessionId, args.target);
+    if (command === 'finish_chat_commit') {
+        const target = chatCommitTargets.get(args.sessionId);
+        if (target && result?.version) loadedChatVersions.set(targetKey(target), result.version);
+        chatCommitTargets.delete(args.sessionId);
+    }
+    if (command === 'abort_chat_commit') chatCommitTargets.delete(args.sessionId);
+    if (command === 'close_resource') serverResources.delete(args.rid);
+    if (command === 'open_cold_chat' && result) { serverResources.add(result.readerId); serverResources.add(result.sourceId); }
+    else if (command.startsWith('open_') && Number.isInteger(result)) serverResources.add(result);
+    return result;
 }
 
+if (typeof globalThis.window?.addEventListener === 'function') {
+    window.addEventListener('pagehide', () => {
+        if (!isServerEnv() || !clientId) return;
+        for (const rid of serverResources) {
+            void fetch('/rpc/close_resource', {
+                method: 'POST', credentials: 'same-origin', keepalive: true,
+                headers: { 'Content-Type': 'application/json', 'x-tauritavern-client-id': clientId },
+                body: JSON.stringify({ rid }),
+            }).catch(() => {});
+        }
+        serverResources.clear();
+    });
+}
 
 export const invoke = (...args) => {
-    const [command, commandArgs] = args;
-    const normalizedArgs = args.length >= 2 && isPlainObject(commandArgs)
-        ? withTauriArgumentAliases(commandArgs)
-        : commandArgs;
-
-    // Re-checked per call rather than captured at module load: the flag is set
-    // by init.js, and tests swap the host between imports.
-    if (detectServerEnv()) {
-        // The server reads camelCase keys only (tauritavern-server/src/rpc.rs).
-        // Sending the aliased object would serialize every snake_case value
-        // twice, doubling large payloads such as base64 file uploads.
-        const httpArgs = args.length >= 2 && isPlainObject(commandArgs)
-            ? toCamelCaseArgs(commandArgs)
-            : commandArgs;
-        return invokeOverHttp(command, httpArgs, args[2]);
-    }
-
+    if (isServerEnv()) return invokeHttp(...args);
     const fn = getTauri()?.core?.invoke;
     if (typeof fn !== 'function') {
         throw new Error('Tauri invoke is unavailable');
     }
 
     if (args.length === 2 && isPlainObject(args[1])) {
-        return fn(command, normalizedArgs);
+        return fn(args[0], withTauriArgumentAliases(args[1]));
     }
 
     return fn(...args);
@@ -228,6 +165,19 @@ export function createChannel(onmessage) {
     return new Channel(onmessage);
 }
 
+export function getCurrentWindow() {
+    const getCurrentWindow = getTauri()?.window?.getCurrentWindow;
+    if (typeof getCurrentWindow !== 'function') {
+        throw new Error('Tauri window API is unavailable');
+    }
+    return getCurrentWindow();
+}
+
+// Optional plugin: absence is a valid state, not an error.
+export function getBarcodeScanner() {
+    return getTauri()?.barcodeScanner;
+}
+
 export const convertFileSrc = (path, protocol = 'asset') => {
     const fn = getTauri()?.core?.convertFileSrc;
     if (typeof fn !== 'function') {
@@ -236,46 +186,8 @@ export const convertFileSrc = (path, protocol = 'asset') => {
     return fn(path, protocol);
 };
 
-export function isTauri() {
-    return detectTauriEnv();
-}
-
-/// True when a TauriTavern backend is reachable, app or server.
-export function hasBackend() {
-    return detectTauriEnv() || detectServerEnv();
-}
-
-export async function initializeBridge() {
-    if (!detectServerEnv()) {
-        const invokeFn = getInvokeFn();
-        if (!invokeFn) {
-            return false;
-        }
-    }
-
-    try {
-        return await invoke('is_ready');
-    } catch (error) {
-        console.error('Failed to initialize the TauriTavern backend bridge:', error);
-        return false;
-    }
-}
-
 export async function getClientVersion() {
-    try {
-        return await invoke('get_client_version');
-    } catch (error) {
-        console.error('Error getting client version from Tauri backend:', error);
-        const version = await invoke('get_version');
-        return {
-            agent: `SillyTavern:${SILLYTAVERN_COMPAT_VERSION}:TauriTavern`,
-            pkgVersion: SILLYTAVERN_COMPAT_VERSION,
-            tauriVersion: version,
-            gitRevision: null,
-            gitBranch: null,
-            defaultUpdateChannel: 'stable',
-        };
-    }
+    return invoke('get_client_version');
 }
 
 export async function checkForUpdate(channel) {
@@ -295,16 +207,11 @@ export async function updateTauriTavernSettings(dto) {
         throw new Error('Invalid TauriTavern settings DTO');
     }
 
-    return invoke('update_tauritavern_settings', { dto });
+    return invokeWithHostNormalization('update_tauritavern_settings', { dto });
 }
 
 export async function getRuntimePaths() {
-    const invokeFn = getInvokeFn();
-    if (!invokeFn) {
-        throw new Error('Tauri invoke is unavailable');
-    }
-
-    return invokeFn('get_runtime_paths');
+    return invoke('get_runtime_paths');
 }
 
 export async function setDataRoot(dataRoot) {
@@ -315,11 +222,6 @@ export async function setDataRoot(dataRoot) {
 }
 
 export async function openDialog(options = {}) {
-    const invokeFn = getInvokeFn();
-    if (!invokeFn) {
-        throw new Error('Tauri invoke is unavailable');
-    }
-
     if (!isPlainObject(options)) {
         throw new Error('Invalid dialog options: expected an object');
     }
@@ -327,6 +229,11 @@ export async function openDialog(options = {}) {
     Object.freeze(options);
 
     return invokeWithHostNormalization('plugin:dialog|open', { options });
+}
+
+export function writeClipboardText(text) {
+    if (isServerEnv()) return navigator.clipboard.writeText(text);
+    return invoke('plugin:clipboard-manager|write_text', { text });
 }
 
 function normalizeExternalUrl(url) {
@@ -343,28 +250,13 @@ function normalizeExternalUrl(url) {
 }
 
 export async function openExternalUrl(url, openWith) {
+    if (isServerEnv()) {
+        window.open(normalizeExternalUrl(url), '_blank', 'noopener,noreferrer');
+        return;
+    }
     const href = normalizeExternalUrl(url);
-    const invokeFn = getInvokeFn();
-
-    if (invokeFn) {
-        return invokeFn('plugin:opener|open_url', {
-            url: href,
-            with: openWith,
-        });
-    }
-
-    const openedWindow = typeof window.open === 'function'
-        ? window.open(href, '_blank', 'noopener,noreferrer')
-        : null;
-
-    if (openedWindow) {
-        return;
-    }
-
-    if (typeof window.location?.assign === 'function') {
-        window.location.assign(href);
-        return;
-    }
-
-    throw new Error('Unable to open external URL');
+    return invoke('plugin:opener|open_url', {
+        url: href,
+        with: openWith,
+    });
 }

@@ -23,6 +23,8 @@ pub enum ServerError {
 
     #[error("{0}")]
     Unauthorized(String),
+    #[error("Endpoint authorization required: {0}")]
+    EndpointAuthorizationRequired(String),
 
     #[error("{0}")]
     Cancelled(String),
@@ -41,6 +43,7 @@ impl ServerError {
             Self::Conflict(_) => StatusCode::CONFLICT,
             Self::NotFound(_) => StatusCode::NOT_FOUND,
             Self::Unauthorized(_) => StatusCode::UNAUTHORIZED,
+            Self::EndpointAuthorizationRequired(_) => StatusCode::FORBIDDEN,
             Self::Cancelled(_) => StatusCode::REQUEST_TIMEOUT,
             Self::TooManyRequests(_) => StatusCode::TOO_MANY_REQUESTS,
             Self::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
@@ -49,9 +52,7 @@ impl ServerError {
 
     /// True when the failure is a chat-integrity rejection.
     ///
-    /// Upstream SillyTavern answers these with `400 {"error":"integrity"}`
-    /// (`src/endpoints/chats.js:490`) and the frontend keys its overwrite prompt
-    /// off that exact shape, so the server must not reword it.
+    /// Preserve the upstream integrity error key while HTTP uses 409 for stale writes.
     pub fn is_integrity_conflict(&self) -> bool {
         matches!(self, Self::Conflict(message) | Self::BadRequest(message)
             if message.to_ascii_lowercase().contains("integrity"))
@@ -94,6 +95,9 @@ impl From<DomainError> for ServerError {
             DomainError::WorkspaceWriteConflict { kind, .. } => {
                 Self::BadRequest(format!("Workspace write conflict: {kind}"))
             }
+            DomainError::FileIo { operation, path, source } => Self::Internal(format!("{operation} {path}: {source}")),
+            DomainError::WorkspaceFileNotText { path } => Self::BadRequest(format!("Workspace file is not UTF-8 text: {path}")),
+            DomainError::WorkspaceAccessDenied { path, operation } => Self::Unauthorized(format!("Cannot {operation} `{path}`: access is not allowed for this task")),
         }
     }
 }
@@ -106,13 +110,19 @@ impl From<serde_json::Error> for ServerError {
 
 impl IntoResponse for ServerError {
     fn into_response(self) -> Response {
-        let status = self.status();
+        if let Self::EndpointAuthorizationRequired(endpoint) = &self {
+            return (StatusCode::FORBIDDEN, Json(json!({"error":"endpoint_authorization_required","endpoint":endpoint}))).into_response();
+        }
+        let status = if self.is_integrity_conflict() { StatusCode::CONFLICT } else { self.status() };
         if status.is_server_error() {
             tracing::error!(error = %self, "Request failed");
         } else {
             tracing::debug!(error = %self, status = %status, "Request rejected");
         }
 
+        if self.is_integrity_conflict() {
+            return (status, Json(json!({"error":"integrity", "message":self.to_string()}))).into_response();
+        }
         (status, Json(json!({ "error": self.to_string() }))).into_response()
     }
 }

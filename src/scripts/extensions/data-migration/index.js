@@ -1,16 +1,13 @@
 import { renderExtensionTemplateAsync } from '../../extensions.js';
 import { t, translate } from '../../i18n.js';
 import { Popup } from '../../popup.js';
-import { isAndroidRuntime, isIosRuntime } from '../../util/mobile-runtime.js';
-import { isServerEnv } from '../../../tauri-bridge.js';
-import { downloadBlobWithRuntime } from '../../file-export.js';
 import { getActiveIosPolicyActivationReport } from '../../tauritavern/ios-policy.js';
+import { flushLifecycleState } from '../../../tauri/main/services/lifecycle/lifecycle-flush-service.js';
+import { isServerEnv } from '../../../tauri-bridge.js';
 
 const MODULE_NAME = 'data-migration';
 const JOB_POLL_INTERVAL_MS = 1200;
 const TERMINAL_JOB_STATES = new Set(['completed', 'failed', 'cancelled']);
-const PREPARING_PROGRESS_INTERVAL_MS = 320;
-const PREPARING_PROGRESS_MAX_BEFORE_JOB = 96;
 
 const SILLYTAVERN_MIGRATION_COPY_KEY = 'Import a SillyTavern data archive (zip, tar, tar.gz, or tgz) and migrate it to TauriTavern.';
 const TAURITAVERN_MIGRATION_COPY_KEY = 'Import a TauriTavern data zip archive from another device and migrate it to this TauriTavern.';
@@ -19,7 +16,6 @@ const jobState = {
     jobId: '',
     starting: false,
     cancelRequested: false,
-    lastExportSavedPath: '',
 };
 
 function extractErrorMessage(text) {
@@ -63,155 +59,47 @@ function requireJobId(payload, errorMessage) {
     return payload.job_id.trim();
 }
 
-async function requestImportJob(url, init) {
-    const response = await fetch(url, init);
-    if (!response.ok) {
-        throw new Error(await readFailureMessage(response));
+async function startImportJob() {
+    let body;
+    if (isServerEnv()) {
+        const input = document.createElement('input');
+        input.type = 'file';
+        input.accept = '.zip,.tar,.gz,.tgz';
+        const archive = await new Promise(resolve => {
+            input.addEventListener('change', () => resolve(input.files?.[0] ?? null), { once: true });
+            input.addEventListener('cancel', () => resolve(null), { once: true });
+            input.click();
+        });
+        if (!archive) return null;
+        body = new FormData();
+        body.set('archive', archive);
     }
-
+    const response = await fetch('/api/extensions/data-migration/import', { method: 'POST', body });
+    if (!response.ok) throw new Error(await readFailureMessage(response));
     const payload = await response.json();
-    return requireJobId(payload, t`Import job id is missing`);
-}
-
-async function startImportJobFromMultipart(file) {
-    const formData = new FormData();
-    formData.append('archive', file);
-    return requestImportJob('/api/extensions/data-migration/import', {
-        method: 'POST',
-        body: formData,
-    });
-}
-
-async function startImportJobFromAndroidContentUri(contentUri) {
-    return requestImportJob('/api/extensions/data-migration/import/android', {
-        method: 'POST',
-        headers: {
-            'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-            content_uri: contentUri,
-        }),
-    });
-}
-
-async function pickAndroidImportArchive() {
-    const response = await fetch('/api/extensions/data-migration/import/android/pick', {
-        method: 'POST',
-    });
-    if (!response.ok) {
-        throw new Error(await readFailureMessage(response));
-    }
-
-    const payload = await response.json();
-    const contentUri = String(payload?.content_uri || '').trim();
-    if (!contentUri) {
-        throw new Error(t`Android import picker did not return a content URI`);
-    }
-
-    return contentUri;
-}
-
-async function startImportJobFromIosPicker() {
-    const response = await fetch('/api/extensions/data-migration/import/ios', {
-        method: 'POST',
-        headers: {
-            'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({}),
-    });
-
-    if (!response.ok) {
-        throw new Error(await readFailureMessage(response));
-    }
-
-    const payload = await response.json();
-    if (payload?.cancelled) {
-        return null;
-    }
-
-    return requireJobId(payload, t`Import job id is missing`);
-}
-
-// The server host has no Downloads folder of its own: the browser downloads
-// the completed archive, and the server disposes of it after streaming it.
-async function downloadServerExportArchive(jobId) {
-    const response = await fetch(`/api/tauritavern/data-migration/export/download?id=${encodeURIComponent(jobId)}`, {
-        method: 'GET',
-        cache: 'no-store',
-    });
-    if (!response.ok) {
-        throw new Error(await readFailureMessage(response));
-    }
-
-    const disposition = response.headers.get('Content-Disposition') || '';
-    const fileName = /filename="([^"]+)"/.exec(disposition)?.[1] || 'tauritavern-data.zip';
-    await downloadBlobWithRuntime(await response.blob(), fileName, { fallbackName: 'tauritavern-data.zip' });
-    return { mode: 'browser', savedPath: '' };
+    return payload.cancelled ? null : requireJobId(payload, t`Import job id is missing`);
 }
 
 async function saveExportArchive(jobId) {
     if (isServerEnv()) {
-        return downloadServerExportArchive(jobId);
+        const response = await fetch(`/api/tauritavern/data-migration/export/download?id=${encodeURIComponent(jobId)}`);
+        if (!response.ok) throw new Error(await readFailureMessage(response));
+        const blob = await response.blob();
+        const url = URL.createObjectURL(blob);
+        const anchor = document.createElement('a');
+        anchor.href = url;
+        anchor.download = `TauriTavern-${jobId}.zip`;
+        anchor.click();
+        setTimeout(() => URL.revokeObjectURL(url), 60000);
+        return { delivered: true };
     }
-
-    if (isAndroidRuntime()) {
-        const response = await fetch('/api/extensions/data-migration/export/android/save', {
-            method: 'POST',
-            headers: {
-                'Content-Type': 'application/json',
-            },
-            body: JSON.stringify({ job_id: jobId }),
-        });
-        if (!response.ok) {
-            throw new Error(await readFailureMessage(response));
-        }
-
-        const payload = await response.json();
-        return {
-            mode: 'mobile-native',
-            cancelled: Boolean(payload?.cancelled),
-            savedPath: String(payload?.saved_target || ''),
-            cleanupError: payload?.cleanup_error ? String(payload.cleanup_error) : null,
-        };
-    }
-
-    if (isIosRuntime()) {
-        const response = await fetch('/api/extensions/data-migration/export/ios/share', {
-            method: 'POST',
-            headers: {
-                'Content-Type': 'application/json',
-            },
-            body: JSON.stringify({ job_id: jobId }),
-        });
-        if (!response.ok) {
-            throw new Error(await readFailureMessage(response));
-        }
-
-        const payload = await response.json();
-        return {
-            mode: 'ios-native-share',
-            completed: Boolean(payload?.completed),
-            activity: payload?.activity ? String(payload.activity) : null,
-            cleanupError: payload?.cleanup_error ? String(payload.cleanup_error) : null,
-        };
-    }
-
     const response = await fetch('/api/extensions/data-migration/export/save', {
         method: 'POST',
-        headers: {
-            'Content-Type': 'application/json',
-        },
+        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ job_id: jobId }),
     });
-    if (!response.ok) {
-        throw new Error(await readFailureMessage(response));
-    }
-
-    const payload = await response.json();
-    return {
-        mode: 'desktop-native',
-        savedPath: String(payload?.saved_target || ''),
-    };
+    if (!response.ok) throw new Error(await readFailureMessage(response));
+    return response.json();
 }
 
 function hasActiveJob() {
@@ -222,28 +110,10 @@ function setStatusText(message) {
     $('#data_migration_status').text(String(message || ''));
 }
 
-function refreshExportActions() {
-    const actions = $('#data_migration_export_actions');
-    if (!actions.length) {
-        return;
-    }
-
-    const savedPath = String(jobState.lastExportSavedPath || '').trim();
-    const visible = Boolean(savedPath) && !isAndroidRuntime() && !isIosRuntime();
-    actions.toggle(visible);
-
-    $('#data_migration_reveal_export_button').prop('disabled', !visible);
-}
-
 function refreshControls() {
     const busy = hasActiveJob();
     $('#data_migration_import_button').prop('disabled', busy);
     $('#data_migration_export_button').prop('disabled', busy);
-    if (busy) {
-        $('#data_migration_reveal_export_button').prop('disabled', true);
-    } else {
-        refreshExportActions();
-    }
 
     const cancelButton = $('#data_migration_cancel_button');
     if (jobState.jobId) {
@@ -277,26 +147,6 @@ function stopJobTracking() {
     refreshControls();
 }
 
-async function onRevealExportClick() {
-    const savedPath = String(jobState.lastExportSavedPath || '').trim();
-    if (!savedPath) {
-        return;
-    }
-
-    try {
-        const invoke = window.__TAURI__?.core?.invoke;
-        if (typeof invoke !== 'function') {
-            throw new Error('Tauri opener is unavailable');
-        }
-
-        await invoke('plugin:opener|reveal_item_in_dir', {
-            paths: [savedPath],
-        });
-    } catch (error) {
-        toastr.error(normalizeCaughtError(error), t`Unable to open folder`);
-    }
-}
-
 async function onImportButtonClick() {
     try {
         if (hasActiveJob()) {
@@ -304,19 +154,7 @@ async function onImportButtonClick() {
             return;
         }
 
-        // Native archive pickers exist only in the mobile app; a phone browser
-        // talking to the server host uses the ordinary file input.
-        if (!isServerEnv() && isAndroidRuntime()) {
-            await onAndroidImportButtonClick();
-            return;
-        }
-
-        if (!isServerEnv() && isIosRuntime()) {
-            await onIosImportButtonClick();
-            return;
-        }
-
-        $('#data_migration_import_input').trigger('click');
+        await runConfirmedImport();
     } catch (error) {
         const failureMessage = normalizeCaughtError(error);
         toastr.error(failureMessage, t`Data import failed`);
@@ -402,7 +240,7 @@ function reloadSoon() {
 }
 
 async function requestCancelActiveJob() {
-    if (!hasRunningJob() || jobState.cancelRequested) {
+    if (!jobState.jobId || jobState.cancelRequested) {
         return;
     }
 
@@ -435,49 +273,15 @@ async function requestCancelActiveJob() {
     }
 }
 
-function createPreparingImportProgress() {
-    let progress = 0;
-    let timerId = null;
-
-    const render = () => {
-        setStatusText(`${t`Preparing import...`} ${progress}%`);
-    };
-
-    return {
-        start() {
-            progress = 0;
-            render();
-
-            timerId = window.setInterval(() => {
-                const step = progress < 60 ? 4 : progress < 85 ? 2 : 1;
-                progress = Math.min(PREPARING_PROGRESS_MAX_BEFORE_JOB, progress + step);
-                render();
-            }, PREPARING_PROGRESS_INTERVAL_MS);
-        },
-        complete() {
-            if (timerId !== null) {
-                clearInterval(timerId);
-                timerId = null;
-            }
-            progress = 100;
-            render();
-        },
-        stop() {
-            if (timerId !== null) {
-                clearInterval(timerId);
-                timerId = null;
-            }
-        },
-    };
-}
-
 async function runMigrationJob(kind, startJob) {
     const failureTitle = kind === 'import' ? t`Data import failed` : t`Data export failed`;
-    const preparingProgress = kind === 'import' ? createPreparingImportProgress() : null;
 
     try {
         markJobStarting();
-        preparingProgress?.start();
+        await flushLifecycleState(`data-archive:${kind}`);
+        if (kind === 'import') {
+            setStatusText(t`Preparing import...`);
+        }
         const jobId = await startJob();
         if (!jobId) {
             if (kind === 'import') {
@@ -488,7 +292,6 @@ async function runMigrationJob(kind, startJob) {
 
             throw new Error(t`Migration job did not return a job id`);
         }
-        preparingProgress?.complete();
         startJobTracking(jobId);
 
         const finalStatus = await pollUntilTerminal(jobId);
@@ -510,42 +313,11 @@ async function runMigrationJob(kind, startJob) {
                 reloadSoon();
             } else {
                 const saveResult = await saveExportArchive(jobId);
-                if (saveResult.mode === 'ios-native-share') {
-                    if (saveResult.cleanupError) {
-                        toastr.warning(saveResult.cleanupError, t`Export cleanup failed`);
-                    }
-
-                    if (saveResult.completed) {
-                        toastr.success(t`Data archive is ready to share/save`, t`Export completed`, { timeOut: 8000 });
-                        setStatusText(t`Export completed`);
-                    } else {
-                        toastr.info(t`Sharing cancelled`, t`Export cancelled`);
-                        setStatusText(t`Export cancelled`);
-                    }
-
-                    return;
-                }
-
-                if (saveResult.mode === 'mobile-native') {
-                    if (saveResult.cleanupError) {
-                        toastr.warning(saveResult.cleanupError, t`Export cleanup failed`);
-                    }
-                    if (saveResult.cancelled) {
-                        toastr.info(t`Export cancelled`);
-                        setStatusText(t`Export cancelled`);
-                        return;
-                    }
-                }
-
-                const savedPath = saveResult.savedPath;
-                if (savedPath) {
-                    jobState.lastExportSavedPath = savedPath;
-                    refreshExportActions();
-                    toastr.success(t`Data archive saved: ${savedPath}`, t`Export completed`, { timeOut: 8000 });
-                    setStatusText(t`Export completed | ${savedPath}`);
-                } else {
-                    toastr.success(t`Data archive saved`, t`Export completed`);
+                if (saveResult.delivered) {
+                    toastr.success(t`Data archive exported`, t`Export completed`);
                     setStatusText(t`Export completed`);
+                } else {
+                    setStatusText(t`Export cancelled`);
                 }
             }
             return;
@@ -579,50 +351,15 @@ async function runMigrationJob(kind, startJob) {
         toastr.error(failureMessage, failureTitle);
         setStatusText(failureMessage);
     } finally {
-        preparingProgress?.stop();
         stopJobTracking();
     }
 }
 
-async function onImportInputChange(event) {
-    if (hasActiveJob()) {
-        toastr.warning(t`A migration job is already running`);
-        return;
-    }
-
-    const input = event.currentTarget;
-    const file = input?.files?.[0];
-    input.value = '';
-
-    if (!file) {
-        return;
-    }
-
-    await runConfirmedImport(() => startImportJobFromMultipart(file));
-}
-
-async function onAndroidImportButtonClick() {
-    await runConfirmedImport(async () => {
-        const contentUri = await pickAndroidImportArchive();
-        return startImportJobFromAndroidContentUri(contentUri);
-    });
-}
-
-async function onIosImportButtonClick() {
-    await runConfirmedImport(() => startImportJobFromIosPicker());
-}
-
-async function runConfirmedImport(startJob) {
+async function runConfirmedImport() {
     const prompt = t`Importing will merge into the current local data directory (same-path files will be overwritten). Continue?`;
-    const confirmed = isIosRuntime()
-        ? await Popup.show.confirm(t`Confirm data import`, prompt)
-        : window.confirm(prompt);
-    if (!confirmed) {
-        return;
-    }
-
+    if (!await Popup.show.confirm(t`Confirm data import`, prompt)) return;
     toastr.info(t`Importing data archive...`);
-    await runMigrationJob('import', startJob);
+    await runMigrationJob('import', startImportJob);
 }
 
 async function onExportClick() {
@@ -657,8 +394,6 @@ jQuery(async () => {
     }
 
     $('#data_migration_import_button').on('click', onImportButtonClick);
-    $('#data_migration_import_input').on('change', onImportInputChange);
     $('#data_migration_export_button').on('click', onExportClick);
     $('#data_migration_cancel_button').on('click', requestCancelActiveJob);
-    $('#data_migration_reveal_export_button').on('click', onRevealExportClick);
 });

@@ -12,7 +12,6 @@
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
-use serde::Deserialize;
 
 use std::sync::Arc;
 
@@ -28,14 +27,8 @@ use crate::state::AppState;
 
 type Handled = Result<Value, ServerError>;
 
-#[derive(Debug, Deserialize)]
-struct StageUploadBeginDto {
-    kind: String,
-    preferred_extension: String,
-    size: u64,
-}
 
-fn arg<T: serde::de::DeserializeOwned>(args: &Value, key: &str) -> Result<T, ServerError> {
+pub(crate) fn arg<T: serde::de::DeserializeOwned>(args: &Value, key: &str) -> Result<T, ServerError> {
     let value = args
         .get(key)
         .ok_or_else(|| ServerError::BadRequest(format!("Missing argument `{key}`")))?;
@@ -43,7 +36,7 @@ fn arg<T: serde::de::DeserializeOwned>(args: &Value, key: &str) -> Result<T, Ser
         .map_err(|error| ServerError::BadRequest(format!("Invalid argument `{key}`: {error}")))
 }
 
-fn opt_arg<T: serde::de::DeserializeOwned>(
+pub(crate) fn opt_arg<T: serde::de::DeserializeOwned>(
     args: &Value,
     key: &str,
 ) -> Result<Option<T>, ServerError> {
@@ -55,7 +48,7 @@ fn opt_arg<T: serde::de::DeserializeOwned>(
     }
 }
 
-fn ok<T: serde::Serialize>(value: T) -> Handled {
+pub(crate) fn ok<T: serde::Serialize>(value: T) -> Handled {
     serde_json::to_value(value)
         .map_err(|error| ServerError::Internal(format!("Failed to serialize response: {error}")))
 }
@@ -67,7 +60,7 @@ const EXPOSED_COMMANDS: &[&str] = &[
     "backend_error_bridge_ready",
     "get_version",
     "get_client_version",
-    "get_bootstrap_snapshot",
+    "get_bootstrap_metadata",
     "get_tauritavern_settings",
     "get_chat_backup_storage_stats",
     "get_all_characters",
@@ -76,34 +69,28 @@ const EXPOSED_COMMANDS: &[&str] = &[
     "get_character_chats",
     "update_character",
     "update_character_card_data",
-    "check_character_lorebook_conflict",
-    "resolve_character_lorebook_conflict",
+    "adopt_character_lorebook",
+    "resolve_character_lorebook_adoption",
     "merge_character_card_data",
     "bulk_merge_character_card_data",
     "delete_character",
     "rename_character",
     "duplicate_character",
-    "stage_upload_begin",
-    "stage_upload_finish",
-    "stage_upload_discard",
+    "stage_file_begin", "stage_file_finish", "stage_file_discard",
     "start_import_data_archive",
     "start_export_data_archive",
     "get_data_archive_job_status",
     "cancel_data_archive_job",
-    "cleanup_export_data_archive",
     "create_character",
     "create_character_with_avatar",
     "import_character",
     "replace_character",
     "update_avatar",
     "export_character_content",
-    "count_openai_tokens",
     "count_openai_tokens_batch",
     "count_openai_token_prefixes",
-    "encode_openai_tokens",
-    "decode_openai_tokens",
+    "encode_tokens", "decode_tokens",
     "build_openai_logit_bias",
-    "apply_native_regex_batch",
     "get_all_backgrounds",
     "get_all_background_metadata",
     "delete_background",
@@ -125,23 +112,11 @@ const EXPOSED_COMMANDS: &[&str] = &[
     "switch_extension_branch",
     "move_extension",
     "download_external_import_url",
-    "get_extension_store_json",
-    "try_get_extension_store_json",
-    "set_extension_store_json",
-    "update_extension_store_json",
     "rename_extension_store_key",
-    "delete_extension_store_json",
-    "list_extension_store_keys",
     "list_extension_store_tables",
+    "list_extension_store_keys",
     "delete_extension_store_table",
-    "get_extension_store_blob",
-    "set_extension_store_blob",
-    "delete_extension_store_blob",
-    "list_extension_store_blob_keys",
     "devlog_append_frontend_logs",
-    "get_sillytavern_settings",
-    "save_user_settings",
-    "save_user_settings_patch",
     "chat_history_generation_started",
     "chat_history_generation_finished",
     "create_settings_snapshot",
@@ -159,11 +134,9 @@ const EXPOSED_COMMANDS: &[&str] = &[
     "delete_user_file",
     "verify_user_files",
     "sanitize_filename",
-    "get_world_infos_batch",
     "normalize_world_info_name",
     "get_avatars",
     "get_all_groups",
-    "save_world_info",
     "save_preset",
     "save_theme",
     "delete_world_info",
@@ -238,7 +211,6 @@ const EXPOSED_COMMANDS: &[&str] = &[
     "restore_group_chat_backup",
     "get_group_chat_summary",
     "get_group_chat_metadata",
-    "set_group_chat_metadata_extension",
     "get_group_chat_store_json",
     "set_group_chat_store_json",
     "update_group_chat_store_json",
@@ -249,7 +221,6 @@ const EXPOSED_COMMANDS: &[&str] = &[
     "search_group_chat_messages",
     // ---- character chat API / windows / backups ------------------------------------
     "get_character_chat_summary",
-    "set_character_chat_metadata_extension",
     "get_character_chat_store_json",
     "set_character_chat_store_json",
     "update_character_chat_store_json",
@@ -264,7 +235,6 @@ const EXPOSED_COMMANDS: &[&str] = &[
     "list_chat_backups",
     "delete_chat_backup",
     "restore_character_chat_backup",
-    "read_chat_backup",
     // ---- world info / presets ---------------------------------------------------------
     "import_world_info",
     "restore_preset",
@@ -297,9 +267,9 @@ const EXPOSED_COMMANDS: &[&str] = &[
 ///
 /// Import/avatar/background commands take a server path because the Tauri host
 /// hands them native file-picker paths. Over HTTP the only legitimate source is
-/// `stage_upload_finish`; anything else would let a client import, copy or
+/// `stage_file_finish`; anything else would let a client import, copy or
 /// delete an arbitrary server file (`/etc/passwd`, `default-user/secrets.json`).
-fn staged(state: &AppState, path: &str) -> Result<(), ServerError> {
+pub(crate) fn staged(state: &AppState, path: &str) -> Result<(), ServerError> {
     state.upload_staging.validate_path(path).map(|_| ())
 }
 
@@ -314,7 +284,7 @@ fn staged_field(state: &AppState, dto: &Value, key: &str) -> Result<(), ServerEr
 /// Skill imports from the browser must carry their bytes (`inlineFiles`,
 /// `archiveBase64`) or a staged archive; `directory` would copy any server
 /// directory into a readable skill.
-fn staged_skill_input(
+pub(crate) fn staged_skill_input(
     state: &AppState,
     input: &tt_domain::models::skill::SkillImportInput,
 ) -> Result<(), ServerError> {
@@ -345,6 +315,8 @@ fn is_exposed(command: &str) -> bool {
 
 async fn run(state: &Arc<AppState>, command: &str, args: Value) -> Handled {
     match command {
+        "list_extension_store_keys" => ok(state.services.extension_store_service.list_keys(
+            &arg::<String>(&args, "namespace")?, opt_arg::<String>(&args, "table")?.as_deref(), arg(&args, "kind")?).await?),
         // ---- readiness / bootstrap -------------------------------------------------
         "is_ready" => ok(true),
         "wait_for_backend_ready" => ok(Value::Null),
@@ -364,7 +336,7 @@ async fn run(state: &Arc<AppState>, command: &str, args: Value) -> Handled {
             "gitBranch": Value::Null,
             "defaultUpdateChannel": "stable",
         })),
-        "get_bootstrap_snapshot" => bootstrap_snapshot(state).await,
+        "get_bootstrap_metadata" => bootstrap_metadata(state).await,
         "get_tauritavern_settings" => ok(state
             .services
             .settings_service
@@ -414,16 +386,8 @@ async fn run(state: &Arc<AppState>, command: &str, args: Value) -> Handled {
                 )
                 .await?)
         }
-        "check_character_lorebook_conflict" => ok(state
-            .services
-            .character_service
-            .check_lorebook_conflict(arg(&args, "dto")?)
-            .await?),
-        "resolve_character_lorebook_conflict" => ok(state
-            .services
-            .character_service
-            .resolve_lorebook_conflict(arg(&args, "dto")?)
-            .await?),
+        "adopt_character_lorebook" => ok(state.services.character_service.adopt_character_lorebook(&arg::<String>(&args, "name")?).await?),
+        "resolve_character_lorebook_adoption" => ok(state.services.character_service.resolve_lorebook_adoption(arg(&args, "dto")?).await?),
         "merge_character_card_data" => ok(state
             .services
             .character_service
@@ -478,14 +442,13 @@ async fn run(state: &Arc<AppState>, command: &str, args: Value) -> Handled {
         }
 
         // ---- upload staging ---------------------------------------------------------
-        "stage_upload_begin" => {
-            let dto: StageUploadBeginDto = arg(&args, "dto")?;
-            ok(state
-                .upload_staging
-                .begin(&dto.kind, &dto.preferred_extension, dto.size)
+        "stage_file_begin" => {
+            let dto: Value = arg(&args, "dto")?;
+            ok(state.upload_staging
+                .begin(dto["kind"].as_str().unwrap_or("generic"), dto["preferred_extension"].as_str().unwrap_or("bin"), dto["size"].as_u64().unwrap_or(0))
                 .await?)
         }
-        "stage_upload_finish" => ok(json!({
+        "stage_file_finish" => ok(json!({
             "file_path": state
                 .upload_staging
                 .finish(
@@ -493,8 +456,9 @@ async fn run(state: &Arc<AppState>, command: &str, args: Value) -> Handled {
                     arg(&args, "expectedSize")?,
                 )
                 .await?,
+            "size": arg::<u64>(&args, "expectedSize")?,
         })),
-        "stage_upload_discard" => ok(state
+        "stage_file_discard" => ok(state
             .upload_staging
             .discard(&arg::<String>(&args, "filePath")?)
             .await?),
@@ -527,10 +491,6 @@ async fn run(state: &Arc<AppState>, command: &str, args: Value) -> Handled {
         >(
             &args, "jobId",
         )?)?),
-        "cleanup_export_data_archive" => ok(state
-            .services
-            .data_archive_service
-            .cleanup_export(&arg::<String>(&args, "jobId")?)?),
 
         // ---- character files --------------------------------------------------------
         "create_character" => ok(state
@@ -581,11 +541,6 @@ async fn run(state: &Arc<AppState>, command: &str, args: Value) -> Handled {
             .await?),
 
         // ---- prompt/token processing -------------------------------------------------
-        "count_openai_tokens" => ok(state
-            .services
-            .tokenization_service
-            .count_openai_tokens(arg(&args, "dto")?)
-            .await?),
         "count_openai_tokens_batch" => ok(state
             .services
             .tokenization_service
@@ -596,25 +551,12 @@ async fn run(state: &Arc<AppState>, command: &str, args: Value) -> Handled {
             .tokenization_service
             .count_openai_token_prefixes(arg(&args, "dto")?)
             .await?),
-        "encode_openai_tokens" => ok(state
-            .services
-            .tokenization_service
-            .encode_openai_tokens(arg(&args, "dto")?)
-            .await?),
-        "decode_openai_tokens" => ok(state
-            .services
-            .tokenization_service
-            .decode_openai_tokens(arg(&args, "dto")?)
-            .await?),
+        "encode_tokens" => ok(state.services.tokenization_service.encode_tokens(arg(&args, "dto")?).await?),
+        "decode_tokens" => ok(state.services.tokenization_service.decode_tokens(arg(&args, "dto")?).await?),
         "build_openai_logit_bias" => ok(state
             .services
             .tokenization_service
             .build_openai_logit_bias(arg(&args, "dto")?)
-            .await?),
-        "apply_native_regex_batch" => ok(state
-            .services
-            .native_regex_service
-            .apply_batch(arg(&args, "dto")?)
             .await?),
 
         // ---- browser appearance ------------------------------------------------------
@@ -788,56 +730,6 @@ async fn run(state: &Arc<AppState>, command: &str, args: Value) -> Handled {
             .download_external_import_url(&arg::<String>(&args, "url")?)
             .await?),
 
-        // ---- extension store ---------------------------------------------------------
-        // `get_*` fails when a key is absent; `try_get_*` reports absence as
-        // `{found: false}`. Extensions rely on that split to tell "never saved"
-        // apart from "backend unavailable", so both are exposed verbatim.
-        "get_extension_store_json" => ok(state
-            .services
-            .extension_store_service
-            .get_json(
-                &arg::<String>(&args, "namespace")?,
-                opt_arg::<String>(&args, "table")?.as_deref(),
-                &arg::<String>(&args, "key")?,
-            )
-            .await?),
-        "try_get_extension_store_json" => {
-            let value = state
-                .services
-                .extension_store_service
-                .try_get_json(
-                    &arg::<String>(&args, "namespace")?,
-                    opt_arg::<String>(&args, "table")?.as_deref(),
-                    &arg::<String>(&args, "key")?,
-                )
-                .await?;
-            // Mirrors ExtensionStoreJsonLookupPayload: `value` is omitted, not
-            // null, when the key was never written.
-            match value {
-                Some(value) => ok(json!({ "found": true, "value": value })),
-                None => ok(json!({ "found": false })),
-            }
-        }
-        "set_extension_store_json" => ok(state
-            .services
-            .extension_store_service
-            .set_json(
-                &arg::<String>(&args, "namespace")?,
-                opt_arg::<String>(&args, "table")?.as_deref(),
-                &arg::<String>(&args, "key")?,
-                arg::<Value>(&args, "value")?,
-            )
-            .await?),
-        "update_extension_store_json" => ok(state
-            .services
-            .extension_store_service
-            .update_json(
-                &arg::<String>(&args, "namespace")?,
-                opt_arg::<String>(&args, "table")?.as_deref(),
-                &arg::<String>(&args, "key")?,
-                arg::<Value>(&args, "value")?,
-            )
-            .await?),
         "rename_extension_store_key" => ok(state
             .services
             .extension_store_service
@@ -846,23 +738,6 @@ async fn run(state: &Arc<AppState>, command: &str, args: Value) -> Handled {
                 opt_arg::<String>(&args, "table")?.as_deref(),
                 &arg::<String>(&args, "key")?,
                 &arg::<String>(&args, "newKey")?,
-            )
-            .await?),
-        "delete_extension_store_json" => ok(state
-            .services
-            .extension_store_service
-            .delete_json(
-                &arg::<String>(&args, "namespace")?,
-                opt_arg::<String>(&args, "table")?.as_deref(),
-                &arg::<String>(&args, "key")?,
-            )
-            .await?),
-        "list_extension_store_keys" => ok(state
-            .services
-            .extension_store_service
-            .list_json_keys(
-                &arg::<String>(&args, "namespace")?,
-                opt_arg::<String>(&args, "table")?.as_deref(),
             )
             .await?),
         "list_extension_store_tables" => ok(state
@@ -876,65 +751,6 @@ async fn run(state: &Arc<AppState>, command: &str, args: Value) -> Handled {
             .delete_table(
                 &arg::<String>(&args, "namespace")?,
                 &arg::<String>(&args, "table")?,
-            )
-            .await?),
-        "get_extension_store_blob" => {
-            let key = arg::<String>(&args, "key")?;
-            let bytes = state
-                .services
-                .extension_store_service
-                .get_blob(
-                    &arg::<String>(&args, "namespace")?,
-                    opt_arg::<String>(&args, "table")?.as_deref(),
-                    &key,
-                )
-                .await?;
-            // snake_case: the frontend reads `content_base64`/`mime_type`
-            // (src/tauri/main/api/extension-store.js getBlob).
-            ok(json!({
-                "content_base64": BASE64_STANDARD.encode(bytes),
-                "mime_type": mime_guess::from_path(&key)
-                    .first_or_octet_stream()
-                    .essence_str(),
-            }))
-        }
-        "set_extension_store_blob" => {
-            let data_base64 = arg::<String>(&args, "dataBase64")?;
-            let data_base64 = data_base64.trim();
-            if data_base64.is_empty() {
-                return Err(ServerError::BadRequest(
-                    "No blob data specified".to_string(),
-                ));
-            }
-            let bytes = BASE64_STANDARD
-                .decode(data_base64.as_bytes())
-                .map_err(|error| ServerError::BadRequest(format!("Invalid base64: {error}")))?;
-            ok(state
-                .services
-                .extension_store_service
-                .set_blob(
-                    &arg::<String>(&args, "namespace")?,
-                    opt_arg::<String>(&args, "table")?.as_deref(),
-                    &arg::<String>(&args, "key")?,
-                    bytes,
-                )
-                .await?)
-        }
-        "delete_extension_store_blob" => ok(state
-            .services
-            .extension_store_service
-            .delete_blob(
-                &arg::<String>(&args, "namespace")?,
-                opt_arg::<String>(&args, "table")?.as_deref(),
-                &arg::<String>(&args, "key")?,
-            )
-            .await?),
-        "list_extension_store_blob_keys" => ok(state
-            .services
-            .extension_store_service
-            .list_blob_keys(
-                &arg::<String>(&args, "namespace")?,
-                opt_arg::<String>(&args, "table")?.as_deref(),
             )
             .await?),
         "devlog_append_frontend_logs" => {
@@ -956,21 +772,6 @@ async fn run(state: &Arc<AppState>, command: &str, args: Value) -> Handled {
         }
 
         // ---- settings --------------------------------------------------------------
-        "get_sillytavern_settings" => ok(state
-            .services
-            .settings_service
-            .get_sillytavern_settings()
-            .await?),
-        "save_user_settings" => ok(state
-            .services
-            .settings_service
-            .save_user_settings(arg(&args, "settings")?)
-            .await?),
-        "save_user_settings_patch" => ok(state
-            .services
-            .settings_service
-            .save_user_settings_patch(arg(&args, "patch")?)
-            .await?),
 
         "chat_history_generation_started" => ok(state
             .services
@@ -1061,18 +862,6 @@ async fn run(state: &Arc<AppState>, command: &str, args: Value) -> Handled {
         }
 
         // ---- world info / presets / themes -----------------------------------------
-        "get_world_infos_batch" => {
-            use tt_application::dto::world_info_dto::{
-                GetWorldInfosBatchDto, GetWorldInfosBatchResponseDto,
-            };
-            let dto: GetWorldInfosBatchDto = arg(&args, "dto")?;
-            let items = state
-                .services
-                .world_info_service
-                .get_world_infos_batch(dto.names)
-                .await?;
-            ok(GetWorldInfosBatchResponseDto { items })
-        }
         "normalize_world_info_name" => {
             use tt_application::dto::world_info_dto::{
                 NormalizeWorldInfoNameDto, NormalizeWorldInfoNameResponseDto,
@@ -1093,14 +882,6 @@ async fn run(state: &Arc<AppState>, command: &str, args: Value) -> Handled {
             .into_iter()
             .map(tt_application::dto::group_dto::GroupDto::from)
             .collect::<Vec<_>>()),
-        "save_world_info" => {
-            let dto: tt_application::dto::world_info_dto::SaveWorldInfoDto = arg(&args, "dto")?;
-            ok(state
-                .services
-                .world_info_service
-                .save_world_info(&dto.name, dto.data)
-                .await?)
-        }
         "save_preset" => {
             let dto: tt_application::dto::preset_dto::SavePresetDto = arg(&args, "dto")?;
             let preset = state.services.preset_service.create_preset(
@@ -1288,10 +1069,10 @@ async fn run(state: &Arc<AppState>, command: &str, args: Value) -> Handled {
                 .await?;
             let visible_tools = services
                 .agent_runtime_service
-                .visible_model_tools(&profile)?;
+                .visible_model_tools(&profile).await?;
             ok(services
                 .prompt_assembly_service
-                .prepare_frontend_prompt_assembly(dto, profile, &visible_tools)
+                .prepare_frontend_prompt_assembly(dto, profile, &visible_tools, tt_domain::models::agent::AgentInvocationExitPolicy::RunFinishAllowed)
                 .await?)
         }
         "build_agent_current_model_connection_snapshot" => {
@@ -1330,9 +1111,8 @@ async fn run(state: &Arc<AppState>, command: &str, args: Value) -> Handled {
                 issues: list.issues,
             })
         }
-        "list_agent_tools" => ok(agent_dto::AgentListToolsResultDto {
-            tools: state.services.agent_runtime_service.tool_catalog_items()?,
-        }),
+        "list_agent_tools" => ok(state.services.agent_runtime_service.tool_catalog_items(
+            opt_arg::<agent_dto::AgentListToolsDto>(&args,"dto")?.unwrap_or_default().context).await?),
         "resolve_agent_system_prompt" => {
             let dto: agent_dto::AgentResolveSystemPromptDto = arg(&args, "dto")?;
             ok(agent_dto::AgentResolveSystemPromptResultDto {
@@ -1366,14 +1146,7 @@ async fn run(state: &Arc<AppState>, command: &str, args: Value) -> Handled {
         }
         "save_agent_profile" => {
             let dto: agent_dto::AgentSaveProfileDto = arg(&args, "dto")?;
-            ok(state
-                .services
-                .agent_profile_service
-                .save_profile(
-                    dto.profile,
-                    state.services.agent_runtime_service.tool_catalog(),
-                )
-                .await?)
+            ok(state.services.agent_runtime_service.save_profile(dto.profile).await?)
         }
         "delete_agent_profile" => {
             let dto: agent_dto::AgentProfileIdDto = arg(&args, "dto")?;
@@ -1400,6 +1173,7 @@ async fn run(state: &Arc<AppState>, command: &str, args: Value) -> Handled {
                 .await?;
             ok(agent_dto::AgentRetargetPresetRefsResultDto {
                 updated: result.profile_ids.len(),
+                session_profile_updated: result.session_profile_updated,
                 profile_ids: result
                     .profile_ids
                     .iter()
@@ -1529,8 +1303,7 @@ async fn run(state: &Arc<AppState>, command: &str, args: Value) -> Handled {
                     path: arg(&args, "path")?,
                     start_line: opt_arg(&args, "startLine")?,
                     line_count: opt_arg(&args, "lineCount")?,
-                    start_char: opt_arg(&args, "startChar")?,
-                    max_chars: Some(max_chars),
+                    max_output_chars: max_chars,
                 })
                 .await?)
         }
@@ -1707,15 +1480,6 @@ async fn run(state: &Arc<AppState>, command: &str, args: Value) -> Handled {
             .group_chat_service
             .get_group_chat_metadata(&arg::<String>(&args, "chatId")?)
             .await?),
-        "set_group_chat_metadata_extension" => ok(state
-            .services
-            .group_chat_service
-            .set_group_chat_metadata_extension(
-                &arg::<String>(&args, "chatId")?,
-                &arg::<String>(&args, "namespace")?,
-                arg(&args, "value")?,
-            )
-            .await?),
         "get_group_chat_store_json" => ok(state
             .services
             .group_chat_service
@@ -1791,16 +1555,6 @@ async fn run(state: &Arc<AppState>, command: &str, args: Value) -> Handled {
                 &arg::<String>(&args, "characterName")?,
                 &arg::<String>(&args, "fileName")?,
                 opt_arg(&args, "includeMetadata")?.unwrap_or(false),
-            )
-            .await?),
-        "set_character_chat_metadata_extension" => ok(state
-            .services
-            .chat_service
-            .set_character_chat_metadata_extension(
-                &arg::<String>(&args, "characterName")?,
-                &arg::<String>(&args, "fileName")?,
-                &arg::<String>(&args, "namespace")?,
-                arg(&args, "value")?,
             )
             .await?),
         "get_character_chat_store_json" => ok(state
@@ -1929,26 +1683,6 @@ async fn run(state: &Arc<AppState>, command: &str, args: Value) -> Handled {
             .chat_service
             .restore_character_chat_backup(arg(&args, "dto")?)
             .await?),
-        // Server analogue of materialize + stream + discard: the materialized
-        // file is a server path the browser cannot open, so return its text.
-        "read_chat_backup" => {
-            let path = state
-                .services
-                .chat_service
-                .materialize_chat_backup(&arg::<String>(&args, "name")?)
-                .await?;
-            let content = tokio::fs::read_to_string(&path).await;
-            let discarded = state
-                .services
-                .chat_service
-                .discard_chat_backup_materialization(&path)
-                .await;
-            let content = content.map_err(|error| {
-                ServerError::Internal(format!("Failed to read chat backup: {error}"))
-            })?;
-            discarded?;
-            ok(content)
-        }
 
         // ---- world info / presets ----------------------------------------------------
         "import_world_info" => {
@@ -2195,12 +1929,19 @@ fn request_id(args: &Value) -> Result<String, ServerError> {
 mod tests {
     use super::*;
 
+
+    async fn save_world(state:&Arc<AppState>,name:&str,data:Value) {
+        let begin=state.services.world_info_service.begin_commit().await.unwrap();
+        let bytes=serde_json::to_vec(&json!({"name":name,"data":data})).unwrap();
+        let size=state.services.world_info_service.append_commit(&begin.session_id,0,&bytes).await.unwrap();
+        state.services.world_info_service.finish_commit(&begin.session_id,size).await.unwrap();
+    }
     #[tokio::test]
-    async fn world_info_batch_reads_saved_entries_with_browser_dto_contract() {
+    async fn world_info_commits_read_raw_bytes_with_browser_dto_contract() {
         let root = std::env::temp_dir().join(format!("tt-world-rpc-{}", rand::random::<u64>()));
         let services = crate::composition::build(
             &root,
-            root.join("resources"),
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../.."),
             Default::default(),
             crate::product::USER_AGENT,
         )
@@ -2212,28 +1953,18 @@ mod tests {
             frontend_dir: root.join("frontend"),
             csrf_token: "test".into(),
             upload_staging: Arc::new(crate::upload::UploadStaging::new(&root)),
+            browser_resources: Default::default(),
+            templates: Default::default(),
         });
         let name = "角色世界书";
         let data = json!({"entries": {"7": {
             "uid": 7, "key": ["城门"], "content": "城门在日落时关闭", "disable": false
         }}});
-        dispatch(
-            &state,
-            "save_world_info",
-            json!({"dto": {"name": name, "data": data}}),
-        )
-        .await
-        .expect("save command exposed")
-        .expect("save world");
-        let response = dispatch(
-            &state,
-            "get_world_infos_batch",
-            json!({"dto": {"names": [name]}}),
-        )
-        .await
-        .expect("batch command exposed")
-        .expect("read with browser request envelope");
-        assert_eq!(response, json!({"items": [{"name": name, "data": data}]}));
+        save_world(&state, name, data.clone()).await;
+        let response = crate::rpc_bytes::dispatch(&state,"test","get_world_info",&json!({"dto":{"name":name}})).await.unwrap().unwrap();
+        assert_eq!(response.headers()[http::header::CONTENT_TYPE],"application/octet-stream");
+        let bytes=axum::body::to_bytes(response.into_body(),usize::MAX).await.unwrap();
+        assert_eq!(serde_json::from_slice::<Value>(&bytes).unwrap(),data);
         drop(state);
         tokio::fs::remove_dir_all(root)
             .await
@@ -2246,7 +1977,7 @@ mod tests {
             std::env::temp_dir().join(format!("tt-world-name-rpc-{}", rand::random::<u64>()));
         let services = crate::composition::build(
             &root,
-            root.join("resources"),
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../.."),
             Default::default(),
             crate::product::USER_AGENT,
         )
@@ -2258,6 +1989,8 @@ mod tests {
             frontend_dir: root.join("frontend"),
             csrf_token: "test".into(),
             upload_staging: Arc::new(crate::upload::UploadStaging::new(&root)),
+            browser_resources: Default::default(),
+            templates: Default::default(),
         });
         let normalize = |dto: Value| {
             let state = state.clone();
@@ -2315,7 +2048,7 @@ mod tests {
         let root = std::env::temp_dir().join(format!("tt-group-rpc-{}", rand::random::<u64>()));
         let services = crate::composition::build(
             &root,
-            root.join("resources"),
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../.."),
             Default::default(),
             crate::product::USER_AGENT,
         )
@@ -2327,6 +2060,8 @@ mod tests {
             frontend_dir: root.join("frontend"),
             csrf_token: "test".into(),
             upload_staging: Arc::new(crate::upload::UploadStaging::new(&root)),
+            browser_resources: Default::default(),
+            templates: Default::default(),
         });
 
         let group = dispatch(
@@ -2379,8 +2114,8 @@ mod tests {
 
         // A tab still holding the first revision must not clobber the second.
         let (status, body) = save(first, Some(first_version), false).await;
-        assert_eq!(status, http::StatusCode::BAD_REQUEST);
-        assert_eq!(body, json!({"error": "integrity"}));
+        assert_eq!(status, http::StatusCode::CONFLICT);
+        assert_eq!(body, json!({"error": "Chat changed since it was loaded; reload or explicitly overwrite"}));
 
         let read = crate::chat::get_group_chat(
             State(state.clone()),
@@ -2439,7 +2174,7 @@ mod tests {
             std::env::temp_dir().join(format!("tt-chat-import-rpc-{}", rand::random::<u64>()));
         let services = crate::composition::build(
             &root,
-            root.join("resources"),
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../.."),
             Default::default(),
             crate::product::USER_AGENT,
         )
@@ -2451,6 +2186,8 @@ mod tests {
             frontend_dir: root.join("frontend"),
             csrf_token: "test".into(),
             upload_staging: Arc::new(crate::upload::UploadStaging::new(&root)),
+            browser_resources: Default::default(),
+            templates: Default::default(),
         });
         let payload = concat!(
             r#"{"chat_metadata":{"variables":{"k":1},"TavernDB_ACU_X":"keep"},"user_name":"我","character_name":"角色"}"#,
@@ -2525,7 +2262,7 @@ mod tests {
             std::env::temp_dir().join(format!("tt-user-files-rpc-{}", rand::random::<u64>()));
         let services = crate::composition::build(
             &root,
-            root.join("resources"),
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../.."),
             Default::default(),
             crate::product::USER_AGENT,
         )
@@ -2537,6 +2274,8 @@ mod tests {
             frontend_dir: root.join("frontend"),
             csrf_token: "test".into(),
             upload_staging: Arc::new(crate::upload::UploadStaging::new(&root)),
+            browser_resources: Default::default(),
+            templates: Default::default(),
         });
         let files_dir = root.join("default-user/user/files");
         let name = "LittleWhiteBox_Assistant.json";
@@ -2675,7 +2414,7 @@ mod tests {
         let root = std::env::temp_dir().join(format!("tt-lorebook-rpc-{}", rand::random::<u64>()));
         let services = crate::composition::build(
             &root,
-            root.join("resources"),
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../.."),
             Default::default(),
             crate::product::USER_AGENT,
         )
@@ -2687,6 +2426,8 @@ mod tests {
             frontend_dir: root.join("frontend"),
             csrf_token: "test".into(),
             upload_staging: Arc::new(crate::upload::UploadStaging::new(&root)),
+            browser_resources: Default::default(),
+            templates: Default::default(),
         });
         let world = |content: &str| {
             json!({"entries": {"1": {
@@ -2722,7 +2463,7 @@ mod tests {
         tokio::fs::create_dir_all(&characters)
             .await
             .expect("characters dir");
-        let check = |name: &str| json!({"dto": {"name": name}});
+        let check = |name: &str| json!({"name": name});
 
         tokio::fs::write(
             characters.join("Plain.png"),
@@ -2730,20 +2471,12 @@ mod tests {
         )
         .await
         .expect("write plain card");
-        let plain = dispatch(&state, "check_character_lorebook_conflict", check("Plain"))
+        let plain = dispatch(&state, "adopt_character_lorebook", check("Plain"))
             .await
             .expect("check exposed")
             .expect("check plain card");
-        assert_eq!(plain["conflict"], json!(false));
-
-        dispatch(
-            &state,
-            "save_world_info",
-            json!({"dto": {"name": "Lore", "data": world("local")}}),
-        )
-        .await
-        .expect("save exposed")
-        .expect("save local world");
+        assert_eq!(plain, json!({"status":"none"}));
+        save_world(&state,"Lore",world("local")).await;
         let book = json!({"name": "Lore", "entries": [{
             "uid": 1, "keys": ["alpha"], "content": "embedded", "extensions": {}
         }], "extensions": {}});
@@ -2754,34 +2487,24 @@ mod tests {
         .await
         .expect("write conflicting card");
 
-        let conflict = dispatch(&state, "check_character_lorebook_conflict", check("Alice"))
-            .await
-            .expect("check exposed")
-            .expect("check conflicting card");
-        assert_eq!(conflict["conflict"], json!(true));
-        assert_eq!(conflict["current_available"], json!(true));
-        let stale_token = conflict["conflict_token"]
+        let conflict = dispatch(&state, "adopt_character_lorebook", check("Alice"))
+            .await.expect("adopt exposed").expect("adopt conflicting card");
+        assert_eq!(conflict["status"], json!("decision"));
+        let stale_token = conflict["token"]
             .as_str()
             .expect("token")
             .to_string();
 
-        dispatch(
-            &state,
-            "save_world_info",
-            json!({"dto": {"name": "Lore", "data": world("edited meanwhile")}}),
-        )
-        .await
-        .expect("save exposed")
-        .expect("edit world meanwhile");
+        save_world(&state,"Lore",world("edited meanwhile")).await;
         let resolve = |token: &str| {
             json!({"dto": {
-                "name": "Alice", "resolution": "embedded", "conflict_token": token
+                "name": "Alice", "choice": "adopt", "token": token
             }})
         };
         assert!(matches!(
             dispatch(
                 &state,
-                "resolve_character_lorebook_conflict",
+                "resolve_character_lorebook_adoption",
                 resolve(&stale_token)
             )
             .await,
@@ -2796,31 +2519,28 @@ mod tests {
             "stale token must not overwrite the newer local world"
         );
 
-        let fresh = dispatch(&state, "check_character_lorebook_conflict", check("Alice"))
+        let fresh = dispatch(&state, "adopt_character_lorebook", check("Alice"))
             .await
             .expect("check exposed")
             .expect("recheck");
         let resolved = dispatch(
             &state,
-            "resolve_character_lorebook_conflict",
-            resolve(fresh["conflict_token"].as_str().expect("fresh token")),
+            "resolve_character_lorebook_adoption",
+            resolve(fresh["token"].as_str().expect("fresh token")),
         )
         .await
         .expect("resolve exposed")
         .expect("resolve with embedded");
-        assert_eq!(resolved["affected_world"], json!("Lore"));
-        assert_eq!(resolved["world_written"], json!(true));
+        assert_eq!(resolved["status"], json!("linked"));
         assert!(
-            tokio::fs::read_to_string(&lore_path)
+            tokio::fs::read_to_string(root.join("default-user/worlds").join(format!("{}.json",resolved["world"].as_str().unwrap())))
                 .await
                 .expect("read resolved world")
                 .contains("embedded")
         );
-        let after = dispatch(&state, "check_character_lorebook_conflict", check("Alice"))
-            .await
-            .expect("check exposed")
-            .expect("check after resolve");
-        assert_eq!(after["conflict"], json!(false));
+        let after = dispatch(&state, "adopt_character_lorebook", check("Alice"))
+            .await.expect("adopt exposed").expect("adopt after resolution");
+        assert_eq!(after["status"], json!("linked"));
 
         drop(state);
         tokio::fs::remove_dir_all(root)
@@ -2971,25 +2691,15 @@ async fn prune_agent_chat_persistent_states(
     })
 }
 
-async fn bootstrap_snapshot(state: &Arc<AppState>) -> Handled {
+async fn bootstrap_metadata(state: &Arc<AppState>) -> Handled {
     let services = &state.services;
-    let (settings, characters, groups, avatars, secret_state) = tokio::try_join!(
-        async { Ok::<_, ServerError>(services.settings_service.get_sillytavern_settings().await?) },
+    let (characters, groups, avatars, secret_state) = tokio::try_join!(
         async { Ok::<_, ServerError>(services.character_service.get_all_characters(true).await?) },
         async { Ok::<_, ServerError>(services.group_service.get_all_groups().await?) },
         async { Ok::<_, ServerError>(services.avatar_service.get_avatars().await?) },
         async { Ok::<_, ServerError>(services.secret_service.read_secret_state().await?) },
     )?;
-
-    ok(json!({
-        "ios_policy": services.ios_policy,
-        "settings": settings,
-        "characters": characters,
-        "groups": groups
-            .into_iter()
-            .map(tt_application::dto::group_dto::GroupDto::from)
-            .collect::<Vec<_>>(),
-        "avatars": avatars,
-        "secret_state": secret_state,
-    }))
+    ok(json!({"ios_policy": services.ios_policy, "characters": characters,
+        "groups": groups.into_iter().map(tt_application::dto::group_dto::GroupDto::from).collect::<Vec<_>>(),
+        "avatars": avatars, "secret_state": secret_state}))
 }

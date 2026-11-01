@@ -31,6 +31,23 @@ impl AgentProfileService {
         .await
     }
 
+    pub async fn resolve_session_profile(
+        &self,
+        definition: AgentProfileDefinition,
+        tool_catalog: &ToolCatalog,
+    ) -> Result<ResolvedAgentProfile, ApplicationError> {
+        let profile = self
+            .resolve_definition(
+                definition,
+                "session:shared".into(),
+                tool_catalog,
+                AgentProfileExternalReferencePolicy::Strict,
+            )
+            .await?;
+        super::readiness::validate_session_profile(&profile)?;
+        Ok(profile)
+    }
+
     pub async fn resolve_profile_for_preview(
         &self,
         input: AgentProfileResolveInput<'_>,
@@ -78,7 +95,12 @@ impl AgentProfileService {
                 let id =
                     AgentProfileId::parse(raw_id).map_err(ApplicationError::ValidationError)?;
                 match self.profile_repository.load_profile(&id).await? {
-                    Some(profile) => (profile, format!("file:{}", id.as_str())),
+                    Some(mut profile) => {
+                        if migrate_profile_schema(&mut profile)? {
+                            self.profile_repository.save_profile(&profile).await?;
+                        }
+                        (profile, format!("file:{}", id.as_str()))
+                    }
                     None if id.as_str() == DEFAULT_AGENT_PROFILE_ID => {
                         (default_writer_profile()?, "built_in".to_string())
                     }
@@ -102,7 +124,7 @@ impl AgentProfileService {
         tool_catalog: &ToolCatalog,
         external_reference_policy: AgentProfileExternalReferencePolicy,
     ) -> Result<ResolvedAgentProfile, ApplicationError> {
-        migrate_profile_schema(&mut definition)?;
+        let _ = migrate_profile_schema(&mut definition)?;
         validate_profile_header(&definition)?;
         validate_preset_binding(
             &definition.preset,
@@ -114,9 +136,9 @@ impl AgentProfileService {
         normalize_context_policy(&mut definition.context)?;
         validate_instructions(&definition.instructions)?;
         validate_plan_policy(&definition.plan)?;
-        validate_tool_policy(&definition.tools, tool_catalog)?;
-        validate_delegation_policy(&definition.delegation, &definition.tools)?;
-        validate_run_policy(&definition.run, &definition.delegation, &definition.tools)?;
+        let tools = validate_tool_policy(&definition.tools, tool_catalog)?;
+        validate_delegation_policy(&definition.delegation, &tools)?;
+        validate_run_policy(&definition.run, &definition.delegation)?;
         validate_skill_policy(&definition.skills)?;
         validate_workspace_policy(&definition.workspace)?;
         let output = resolve_output_policy(&definition.output, &definition.workspace)?;
@@ -133,7 +155,7 @@ impl AgentProfileService {
             context: definition.context,
             delegation: definition.delegation,
             instructions: definition.instructions,
-            tools: definition.tools,
+            tools,
             skills: definition.skills,
             workspace: definition.workspace,
             plan: definition.plan,

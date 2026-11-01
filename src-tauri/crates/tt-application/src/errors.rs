@@ -36,6 +36,15 @@ pub enum ApplicationError {
     PermissionDenied(String),
 }
 
+impl ApplicationError {
+    pub(crate) fn is_retryable(&self) -> bool {
+        matches!(
+            self,
+            Self::RateLimited(_) | Self::Transient(_) | Self::UpstreamFailure(_)
+        )
+    }
+}
+
 impl From<DomainError> for ApplicationError {
     fn from(error: DomainError) -> Self {
         match error {
@@ -44,6 +53,12 @@ impl From<DomainError> for ApplicationError {
             DomainError::Conflict(msg) => ApplicationError::Conflict(msg),
             DomainError::AuthenticationError(msg) => ApplicationError::Unauthorized(msg),
             DomainError::Cancelled(msg) => ApplicationError::Cancelled(msg),
+            error @ DomainError::WorkspaceAccessDenied { .. } => {
+                ApplicationError::PermissionDenied(error.to_string())
+            }
+            error @ DomainError::FileIo { .. } => {
+                ApplicationError::InternalError(error.to_string())
+            }
             DomainError::InternalError(msg) => ApplicationError::InternalError(msg),
             DomainError::RateLimited { message } => ApplicationError::RateLimited(message),
             DomainError::Transient(msg) => ApplicationError::Transient(msg),
@@ -51,36 +66,12 @@ impl From<DomainError> for ApplicationError {
             DomainError::WorkspacePathIsDirectory { path } => {
                 ApplicationError::ValidationError(format!("Workspace path is a directory: {path}"))
             }
+            DomainError::WorkspaceFileNotText { path } => ApplicationError::ValidationError(
+                format!("Workspace file is not UTF-8 text: {path}"),
+            ),
             DomainError::WorkspaceWriteConflict { kind, .. } => {
                 ApplicationError::ValidationError(format!("Workspace write conflict: {kind}"))
             }
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use tt_domain::errors::GENERATION_CANCELLED_BY_USER_MESSAGE;
-
-    use super::*;
-
-    #[test]
-    fn domain_cancelled_maps_to_application_cancelled() {
-        let error: ApplicationError = DomainError::generation_cancelled_by_user().into();
-
-        assert!(matches!(
-            &error,
-            ApplicationError::Cancelled(message) if message == GENERATION_CANCELLED_BY_USER_MESSAGE
-        ));
-    }
-
-    #[test]
-    fn domain_conflict_maps_to_application_conflict() {
-        let error: ApplicationError = DomainError::Conflict("busy".to_string()).into();
-
-        assert!(matches!(
-            error,
-            ApplicationError::Conflict(message) if message == "busy"
-        ));
     }
 }

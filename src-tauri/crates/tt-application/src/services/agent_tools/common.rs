@@ -1,14 +1,5 @@
 use serde_json::{Map, Value};
 
-use super::structured::{ToolErrorStructured, structured_value};
-
-use tt_domain::models::agent::AgentToolResult;
-use tt_domain::models::tool::ToolInvocation;
-
-pub(super) fn object_args(call: &ToolInvocation) -> Option<&Map<String, Value>> {
-    call.arguments.as_object()
-}
-
 pub(super) fn required_trimmed_string_arg<'a>(
     args: &'a Map<String, Value>,
     key: &str,
@@ -54,6 +45,13 @@ pub(super) fn optional_bool_arg(
         .ok_or_else(|| format!("{key} must be a boolean"))
 }
 
+pub(super) fn ensure_only_args(args: &Map<String, Value>, allowed: &[&str]) -> Result<(), String> {
+    match args.keys().find(|key| !allowed.contains(&key.as_str())) {
+        Some(key) => Err(format!("{key} is not supported")),
+        None => Ok(()),
+    }
+}
+
 pub(crate) const WORKSPACE_PATH_IS_DIRECTORY_CODE: &str = "workspace.path_is_directory";
 
 /// Shared model-facing wording for the typed workspace-directory domain
@@ -63,20 +61,4 @@ pub(crate) fn workspace_path_is_directory_message(path: &str) -> String {
     format!(
         "workspace path `{path}` is a directory; call workspace_list_files to list its contents and re-target a specific file."
     )
-}
-
-pub(super) fn tool_error(
-    call: &ToolInvocation,
-    error_code: &str,
-    message: &str,
-) -> AgentToolResult {
-    AgentToolResult {
-        call_id: call.call_id.clone(),
-        tool_id: call.tool_id.clone(),
-        content: message.to_string(),
-        structured: structured_value(ToolErrorStructured::new(error_code, message)),
-        is_error: true,
-        error_code: Some(error_code.to_string()),
-        resource_refs: Vec::new(),
-    }
 }

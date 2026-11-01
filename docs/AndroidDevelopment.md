@@ -2,76 +2,22 @@
 
 本文档记录当前移 Android 端开发中已经踩过的关键问题、根因分析、已落地方案，以及对应的架构改动。目标是避免重复踩坑，并为后续替换官方修复留出清晰迁移路径。
 
-## 1. Android WebView 安全区注入时机竞态
+当前支持 Android 8.0（API 26）及以上，并要求系统 WebView/Chrome 已更新到能执行 ES2020 的版本。
 
-### 1.1 现象
+## 构建工具链
 
-- `#top-settings-holder` 偶发沉入状态栏。
-- 现象不稳定：同一版本在不同启动时机下表现不同。
-- 简单删除延时重试后，问题明显回归。
+Gradle 工程跟随 Tauri CLI 的 Android 模板，当前对齐 2.12.3：Gradle 9.6.1、AGP 9.3.1、Kotlin Gradle Plugin 2.2.10。升级 Tauri 时按模板差异同步；AGP 版本同时写在根 `build.gradle.kts` 和 `buildSrc/build.gradle.kts`，两处一起改。
 
-### 1.2 根因
+- `compileSdk`、`targetSdk` 为 36。targetSdk 37 起访问局域网需要 `ACCESS_LOCAL_NETWORK` 运行时权限，提升前先建立统一的本地网络权限入口。
+- 开启 configuration cache：`BuildTask` 经 `ExecOperations` 调用 CLI，执行阶段不访问 `Project`。
+- `android.builtInKotlin=false`、`android.newDsl=false` 与模板一致，因为 Tauri 与官方插件仍应用 `org.jetbrains.kotlin.android`。
+- release 沿用 `proguard-android-optimize.txt`，`@JavascriptInterface` 方法由其中的默认规则保留；`proguard-rules.pro` 只补依赖缺失的规则，原因写在规则旁。
 
-根因不是 inset 数值计算本身，而是 **注入时机竞态**：
+## 1. 原生内容视口与窗口背景
 
-- Android WebView 启动阶段常经历 `about:blank -> tauri.localhost` 的页面切换。
-- 若在 `about:blank` 或前端根容器（`#sheld`）尚未出现时注入 CSS 变量，后续导航/重置会丢失变量。
-- 表层看是“safe area 失效”，本质是“注入到了错误上下文或过早上下文”。
+`AndroidWindowLayout` 拥有主 WebView 的矩形：系统栏、刘海和停靠键盘在原生层消费，网页按普通视口排版。`WindowLayoutPlugin` 供 Rust 读取窗口快照、提交背景条带。职责、提交时机与背景链路见 [CurrentState/MobileStyleAdaptation.md](CurrentState/MobileStyleAdaptation.md)。
 
-参考问题：  
-https://github.com/tauri-apps/tauri/issues/14240
-
-### 1.3 当前实现
-
-核心入口仍是 `src-tauri/crates/tauritavern/gen/android/app/src/main/java/com/tauritavern/client/MainActivity.kt`，但职责已拆分为：
-
-- `AndroidInsetsBridge.kt`：系统栏/IME inset 监听与 CSS 变量注入；
-- `WebViewReadinessPoller.kt`：页面就绪轮询；
-- `ShareIntentParser.kt`：分享 Intent 解析与导入文件持久化；
-- `SharePayloadDispatcher.kt`：分享 payload 队列与前端 bridge 分发；
-- `MainActivity.kt`：仅保留生命周期编排与模块协作。
-
-- 保留 edge-to-edge 与透明系统栏配置（沉浸基础）；
-- 监听系统栏与 IME inset；
-- 在 native 侧消费 IME 语义并把底部避让作为 CSS 变量注入；不再让 descendant WebView 将 IME 继续解释为 viewport resize；
-- Android native 注入的 CSS 变量（provider 层）：
-  - `--tt-inset-top/right/left/bottom`（布局应避开的有效 inset：system bars + cutout 等，沉浸模式下为 0）
-  - `--tt-ime-bottom`（输入法可见时的底部 inset）
-  - `--tt-base-viewport-height`（无 IME 时的基准 viewport 高度）
-- 前端布局消费的 CSS 变量（contract 层）：
-  - `--tt-inset-top/right/left/bottom`（有效避让 inset；iOS 由 `env()` 提供，Android 由 native 注入覆盖）
-  - `--tt-viewport-bottom-inset`（前端通过 `max()` 合成有效底部 inset）
-
-Android 语义说明（以 contract 层为准）：
-
-- `--tt-inset-*` 表示**当前布局应避开的有效 inset**；
-- 非沉浸模式下，它反映 system bars + `displayCutout`（刘海/打孔）的可见/稳定 inset；
-- 沉浸模式下，它会回落为 `0`，允许应用顶部 UI 与第三方 fixed 浮层以 full-bleed 方式沉入状态栏区域。
-- `--tt-ime-bottom` 是 Android 上唯一的键盘布局信号；WebView 本身不应再把 IME 当作页面 viewport 缩放来源。
-
-注入时序约束：
-
-- 注入前先检查页面就绪：
-  - `location.href !== 'about:blank'`
-  - `Boolean(document.getElementById('sheld'))`
-  - 未满足时进行有限次短重试。
-
-说明：
-
-- 这里**不以 `readyState` 作为硬门槛**：SillyTavern 启动阶段可能在 `readyState=loading` 时就触发 popup/onboarding 的 focus 流；IME ownership 路由依赖早期 bridge 可用，因此以“`#sheld` 已挂载”作为最小可靠前置条件更稳。
-
-前端消费变量在：
-
-- `src/style.css`（变量定义与 fallback）
-- `src/css/mobile-styles.css`（顶部栏与容器定位使用 contract 变量）
-
-### 1.4 维护原则
-
-- 不要把“就绪态判断”误删为一次性注入。
-- 不要把此问题误判为纯 CSS 问题；先验证变量是否被注入到正确页面上下文。
-- 若后续 Tauri 官方修复 WebView safe-area 注入时序，可再评估收敛逻辑。
-
----
+清单中的 `adjustResize` 只供 androidx 在 API 26-29 上推导键盘 inset；布局不依赖系统缩放窗口。
 
 ## 2. Android 资源访问语义差异（APK assets）
 
@@ -92,9 +38,8 @@ https://v2.tauri.app/develop/resources/#android
 
 `src-tauri/crates/tauritavern/build.rs` 现在会：
 
-- 扫描 `../default/content` 和 `../src/scripts/templates`；
-- 生成 `default_content_manifest.json`（默认内容清单）；
-- 生成 `embedded_resources.rs`（虚拟路径 -> `include_bytes!` 映射）。
+- 扫描 `../default/content`，生成 `default_content_manifest.json`（默认内容清单）；
+- 需要内嵌资源时，把前端模板与内置扩展的 HTML 模板写入 `embedded_resources.rs`（虚拟路径 -> `include_bytes!` 映射）。
 
 #### B. 运行时统一资源访问入口
 
@@ -108,15 +53,16 @@ https://v2.tauri.app/develop/resources/#android
 
 平台策略：
 
-- Android：优先走构建期嵌入资源映射；
-- 非 Android：走 `BaseDirectory::Resource` + fs 访问。
+- Android 与 OpenHarmony：`build.rs` 发出 `embedded_resources`，只读嵌入映射；
+- 其他平台：走 `BaseDirectory::Resource` + fs 访问；portable 构建在磁盘未命中时回退到嵌入映射。
 
 #### C. 前后端模板读取解耦
 
 - 后端新增命令：`read_frontend_template`  
   文件：`src-tauri/crates/tauritavern/src/presentation/commands/bridge.rs`
-- 前端模板加载改为 Tauri 环境下优先 invoke：  
+- 内置模板通过 `invoke('read_frontend_template')` 读取：
   文件：`src/scripts/templates.js`
+- 内置扩展模板只在嵌入映射中，桌面 bundle 不含，所以 `templates.js` 仅在 Android 上用 `read_frontend_extension_template` 读取，其他宿主走 fetch。
 
 #### D. 默认内容初始化改为“资源 -> 真实文件”复制流程
 
@@ -151,30 +97,6 @@ https://v2.tauri.app/develop/resources/#android
 - 平台差异被收敛到一个模块，不向业务层扩散；
 - 未来若 iOS 出现类似目录异常，可在同一模块增加 `cfg(target_os = "ios")` 分支，不需要修改各仓储。
 
-### 3.4 公共 Downloads 导出不是应用数据目录问题
-
-角色卡、Preset、WorldInfo 等前端普通导出遵循浏览器下载语义：用户点击导出后，文件应出现在 Android 公共下载目录（通常显示为 `/storage/emulated/0/Download`），而不是 app-scoped 外部目录。
-
-需要特别区分：
-
-- `appDataDir/localDataDir` 问题处理的是应用数据根目录；
-- Tauri Android 的 `downloadDir()` 可能解析到 `/storage/emulated/0/Android/data/<package>/files/Download`，这对应用私有文件是合理位置，但不是用户导出文件的成功目标；
-- Tauri fs capability 只表达 Tauri 插件 allowlist，不等价于 Android scoped storage 的系统级公共目录写入授权。
-
-当前方案：
-
-- 普通 Blob 下载主链仍收口在前端 `download()` / `downloadBlobWithRuntime()`，保持 SillyTavern 上游调用语义；
-- 前端先把 Blob 分块写入 app cache 下的 `tauritavern-export-staging`，native bridge 只接受该 staging 根下的 canonical file；
-- Android 10+ 使用 native `MediaStore.Downloads` 写入公共 Downloads；
-- Android 7-9 无可靠的无权限公共 Downloads 裸路径写入语义，回退到 SAF `ACTION_CREATE_DOCUMENT`，由用户选择保存目标；
-- 不再把 app-scoped `Download` 作为普通导出的 fallback；公共下载写入失败必须向前端暴露错误。
-
-维护原则：
-
-- 不要通过修改 `infrastructure/paths.rs` 或强行拼接 `/storage/emulated/0/Download` 来实现普通导出；
-- 不要给普通导出引入 `MANAGE_EXTERNAL_STORAGE` 或宽泛存储权限；
-- 如需新增 Android 用户可见文件导出，优先复用 native public download bridge，而不是直接使用 Tauri `downloadDir()`。
-
 ---
 
 ## 4. 与上述问题相关的关键架构调整
@@ -197,8 +119,8 @@ https://v2.tauri.app/develop/resources/#android
 
 ### 4.4 前端接入点
 
-- `src/scripts/templates.js`：模板读取在 Tauri 环境下走 `invoke('read_frontend_template')`
-- `src/css/mobile-styles.css` + `src/style.css`：通过 `--tt-inset-*` 消费布局契约
+- `src/scripts/templates.js`：内置模板走 `invoke('read_frontend_template')`
+- `src/css/mobile-styles.css` + `src/style.css`：按已经避让的浏览器视口排版，`--doc-height` 为静态 CSS 别名
 
 ---
 
@@ -207,17 +129,24 @@ https://v2.tauri.app/develop/resources/#android
 1. **Tauri 官方修复目录 API 后**  
    `infrastructure/paths.rs` 会自动优先使用修复后的 `app_data_dir`，无需在仓储层做分散修补。
 
-2. **Tauri 官方修复 WebView safe-area 注入后**  
-   可评估简化 `MainActivity` 的“页面就绪后注入”逻辑，但必须先验证不会回归 `about:blank` 时序竞态。
-
-3. **新增移动端特性时**  
+2. **新增移动端特性时**
    优先复用现有单点抽象（`assets.rs` / `paths.rs` / `MainActivity.kt`），避免再次把平台差异扩散到业务代码。
 
 ---
 
-## 6. AI 生成通知生命周期
+## 6. AI 生成后台执行与通知生命周期
 
-Android AI 生成通知由 native 侧拥有生命周期，前端只表达 SillyTavern 语义上的“生成开始/进度/结束”事件。
+Android AI 生成使用任务级 `dataSync` Foreground Service。Rust `ChatCompletionService` 持有生成任务与后台执行租约；WebView 只负责消费流事件，并在 Android 16+ 可用时补充非关键的 token 进度。
+
+执行契约：
+
+- 第一个 Chat Completion 任务开始时，由 Rust 通过原生 Tauri plugin 启动 `AiGenerationForegroundService`；
+- 并发任务通过稳定 task id 计数，共享一个 FGS；
+- 最后一个任务成功、失败或取消后立即 `stopForeground()` + `stopSelfResult()`；
+- Service 使用 `START_NOT_STICKY`，不会在没有真实生成任务时被系统复活；
+- Android 15+ `dataSync` 超时时通过 `onTimeout()` 立即释放 FGS，但不把平台保护到期升级为生成失败；
+- 应用启动本身不再启动保活服务，避免无任务时消耗 Android 的后台 FGS 配额。
+- 原生插件不可用或 FGS 启停失败只记录警告；Chat Completion 仍按真实 provider 结果继续，不阻塞应用启动或生成。
 
 当前通知槽位：
 
@@ -228,7 +157,7 @@ Android AI 生成通知由 native 侧拥有生命周期，前端只表达 SillyT
 
 - 应用前台可交互态定义为 `Activity resumed && window focused`；
 - 应用进入前台可交互态、冷启动、或收到新的 launch intent 时，只清除 `42001`；
-- 生成结束时，如果应用已经前台可交互，则不再发布完成通知；
+- Rust 任务结束时，如果应用已经前台可交互、请求为 quiet 或任务被取消，则不发布完成通知；
 - 发布新的完成通知前先清除旧的 `42001`，避免 fixed notification id 上的静默复用；
 - 完成通知不使用 `onlyAlertOnce`；保活/进度通知仍可使用，避免 token 进度频繁打扰。
 
@@ -236,6 +165,7 @@ Android AI 生成通知由 native 侧拥有生命周期，前端只表达 SillyT
 
 - 不要用 `cancelAll()` 清通知，避免误伤系统或未来扩展通知；
 - 不要把 native completion 能力绑定到 Android 16+ `ProgressStyle`，旧版 Android 也需要完成通知生命周期；
+- 不要把 FGS 的结束重新绑定到 WebView 回调；WebView 被系统挂起时，Rust 任务仍必须能够独立释放原生租约；
 - 不要让前端承担 Android 通知栏清理职责，前端应继续保持上游 SillyTavern 的事件语义。
 
 ---
@@ -244,7 +174,9 @@ Android AI 生成通知由 native 侧拥有生命周期，前端只表达 SillyT
 
 以下问题仅在 Android 旧 WebView 上高概率出现，桌面端通常不复现。
 
-### 7.1 `*.at is not a function`
+### 7.1 JavaScript 运行时兼容
+
+#### `*.at is not a function`
 
 现象：
 
@@ -259,8 +191,14 @@ Android AI 生成通知由 native 侧拥有生命周期，前端只表达 SillyT
 
 - 在 Tauri mobile 启动期安装运行时兼容层：
   - 实现：`src/tauri/main/compat/mobile/mobile-runtime-compat.js`
-  - 入口：`src/tauri/main/bootstrap.js`（仅 Android/iOS UA）
-  - 行为：仅补齐缺失 API，且只执行一次；桌面端/移动端 Web 不启用。
+  - 入口：`src/tauri/main/bootstrap.js`（仅移动宿主）
+  - 行为：基础 API 仅在缺失时补齐，且只执行一次；桌面宿主不启用。
+
+#### Web Clipboard 写入被拒绝
+
+Android WebView 可能暴露 `navigator.clipboard.writeText()`，却在调用时以 `NotAllowedError` 拒绝写入。TauriTavern 第一方复制在所有平台统一走 `writeClipboardText()`；Android 兼容层只把上游 Web Clipboard 的 `writeText` 映射到同一原生写入器，并保留 Clipboard 对象上的其他方法。
+
+原生侧只授予 `clipboard-manager:allow-write-text`。写入剪贴板不需要 Android manifest 或运行时权限，也不开放读取能力；失败直接返回调用方，不静默回退。
 
 ### 7.2 插件面板样式大面积失效（如 `TH-custom-tailwind` 布局错乱）
 
@@ -285,39 +223,9 @@ Android AI 生成通知由 native 侧拥有生命周期，前端只表达 SillyT
 - 不再在前端预取/Blob 注入，避免低端设备 CSS AST 处理导致的卡顿与超时。
 
 
-### 6.3 JS-Slash-Runner 脚本弹窗贴顶（关闭按钮落入状态栏）
+### 6.3 第三方面板可达性
 
-现象：
-
-- 某些脚本运行后弹窗顶部被状态栏遮挡，关闭按钮不可点击。
-
-根因：
-
-- 脚本运行时直接向主文档注入 `<style>`；
-- 规则常见为 `position: fixed` + `top: 0`，绕过了扩展 CSS 资源链路中的现有修正。
-
-已落地方案：
-
-- 在 Tauri mobile 安装第三方 surface classifier + CSS contract：
-  - JS classifier（admission-time）：
-    - 分类/契约输出：`src/tauri/main/compat/mobile/mobile-overlay-surface-admission.js`
-    - 观察与有界 settle window：`src/tauri/main/compat/mobile/mobile-overlay-compat-controller.js`
-    - 同源 iframe bridge：`src/tauri/main/compat/mobile/mobile-iframe-viewport-contract-bridge.js`
-    - 入口：`src/tauri/main/bootstrap.js`（仅 Android/iOS UA）
-    - 策略：观察 `document.body` 直系子节点增删，并对 `script_id` portal root 扫描其子树；对已跟踪候选仅监听自身生命周期属性（`class/style/hidden/open/aria-hidden`）以撤销/恢复 host-admitted contract，属性重算按 animation frame 合并；稳定的 `free-window` 只响应 inline lifecycle style（`display/visibility/position/pointer-events/cursor/touch-action`）变化，几何类 style 写入保持在拖动热路径之外；对命中元素分类并输出：
-      - `data-tt-mobile-surface="backdrop|viewport-host|fullscreen-window|free-window|edge-window"`
-      - `data-tt-mobile-surface-admitted="1"`（host-private sentinel）
-      - `--tt-original-top=<px>`（仅 edge-window）
-    - 显式 opt-in：若节点已带 `data-tt-mobile-surface`，将尊重并不再改写。
-  - CSS contract：由 `src/tauri/main/compat/mobile/mobile-geometry-firewall.js` 提供 `[data-tt-mobile-surface="..."]` 的几何规则，统一执行 safe-area 约束（backdrop 保持 full-bleed）。
-  - 依赖：`--tt-inset-* / --tt-viewport-bottom-inset` 表示当前布局策略；非沉浸模式下会提供 safe-area 避让，沉浸模式下回落为 `0`，因此 contract 会自然退化为 full-bleed。
-
-设计约束：
-
-- 仅 Tauri mobile 生效；
-- 仅作用于第三方顶层浮层/窗口 surface，不改写全局 `<style>` 文本与静态主样式文件；
-- 明确排除 `body/#sheld/#chat` 等应用核心容器，避免牵连应用本体布局；
-- 不侵入第三方扩展资源加载链路（与 `third-party-runtime.js` 解耦）。
+脚本、portal、iframe 与 `<dialog>` 的 `top: 0` 就是内容视口顶部，`100vh` 随停靠键盘收缩。只有某个面板越界时，检查它自己的硬编码尺寸、负坐标或滚动裁剪；所有内容一起偏移时，检查原生 WebView 矩形。
 
 ---
 
@@ -345,7 +253,7 @@ Android AI 生成通知由 native 侧拥有生命周期，前端只表达 SillyT
 
 维护原则：
 
-- 不修改 auto-generated 的 `src-tauri/crates/tauritavern/gen/android/.../generated/*`，避免升级冲突。
+- `src-tauri/crates/tauritavern/gen/android/.../generated/*` 是由 Cargo.lock 锁定的 Tauri/Wry 构建脚本重建的派生物，不纳入版本控制，也不承载本地语义。
 - UI 分层判断与关闭动作只写在 JS；Kotlin 不写 DOM/UI 规则，只做拦截/转发/退出决策。
 - 若未来新增/变更 UI 层级，只在 `back-navigation.js` 增加一个分支即可；更详细设计见 `docs/AndroidBackNavigation.md`。
 
@@ -368,7 +276,7 @@ Android AI 生成通知由 native 侧拥有生命周期，前端只表达 SillyT
 
 - 新增 `AndroidWebFullscreenController.kt`，负责：
   - 将 WebView 请求的 custom view 挂到 Activity 内容根节点；
-  - 全屏期间强制开启 immersive system bars，退出时恢复先前状态；
+  - 全屏期间隐藏系统栏；这是独立的展示状态，不改变用户沉浸偏好与主 WebView 矩形；
   - 暴露 `hide()`，让 Android 返回键优先退出网页全屏。
 - `MainActivity.kt` 实现 `AndroidWebFullscreenHost`，只做生命周期编排与 controller 委托。
 - `AndroidBackNavigationController.kt` 新增 native back 优先消费点，先尝试退出网页全屏，再决定是否把返回键交给前端/退出应用。
@@ -399,13 +307,24 @@ Android AI 生成通知由 native 侧拥有生命周期，前端只表达 SillyT
 - 不做前端 fullscreen polyfill 或静默降级，失败直接暴露，便于定位真实链路问题；
 - 未来升级 Tauri / Wry 时，只需要对比 upstream 的 `RustWebChromeClient.kt` 与本地替代版本的差异。
 
+### 8.3 Wry Android 生成层所有权
+
+`generated/*` 只是一份可重建的构建输出。项目实际维护的 Wry 分叉只有 generated 目录外、同 package 同类名的两个文件，Gradle 排除对应 generated 类以避免重复编译：
+
+- `RustWebChromeClient.kt`：fullscreen 转发与 JSONL MIME 补充；Activity result 与权限 launcher 归上游 `WryActivity`，本类只调用其接口；
+- `RustWebViewClient.kt`：拦截失败日志与错误响应，以及 Host Resource 显式缓存策略优先级。
+
+两个文件头必须记录当前 Wry baseline。升级 Wry 时逐文件与锁文件解析到的 upstream 模板比较；缺少显式 `Cache-Control` 的自定义协议响应采用 Wry 的 `no-store` 默认值，Host Resource 已明确返回的 `private, no-cache` 或错误 `no-store` 不得被 transport 层覆盖。删除 generated 目录后，debug 与 minified release 构建都必须能够从零重建。
+
+`app/tauri.build.gradle.kts` 同样是 ignored 派生物：`tauri-build` 会在其中声明 `androidx.lifecycle:lifecycle-process`。tracked `app/build.gradle.kts` 只应用该脚本，不重复维护依赖版本；从空生成目录完成 canonical debug/release 构建用于证明生成顺序和依赖闭合。
+
 ---
 
 ## 9. Android WebView 视频背景 Range 语义差异（SillyTavern-VideoBackgrounds）
 
 现象：
 
-- Android 端 `<video src="/backgrounds/*.mp4">` 无法进入播放，页面表现为“只有一个大播放按钮”。
+- Android 端 `<video src="/backgrounds/*.mp4">` 无法进入播放。默认 poster 是透明的，不能凭播放按钮判断是否已加载。
 - DevTools 常见表现为：
   - 早期出现 `416 Range Not Satisfiable` 或某个 `Range: bytes=...-` 请求被快速 canceled；
   - `<video>` 长时间停留在 `readyState=HAVE_NOTHING`，无法触发 `loadedmetadata`。
@@ -426,51 +345,40 @@ Android AI 生成通知由 native 侧拥有生命周期，前端只表达 SillyT
 
 ---
 
-## 10. Android Skill 导入文件选择
+## 10. Android 文件导入与导出
 
-现象：
+Android 是[文件传输](CurrentState/FileTransfer.md)的一个平台实现，与鸿蒙共用 URI 复制代码。`ContentUriPlugin` 负责查询原文件名。升级 Tauri 或 dialog/fs 插件后，要用 release 构建验收两点：Rust 调用原生插件是否正常；从云盘 provider 选取时，文件名与内容是否正确。
 
-- 桌面端 Agent System 的 Skill 导入会弹出系统文件选择器；
-- Android 端不能依赖桌面 `dialog.open` 返回普通文件路径，系统选择器返回的是 `content://` URI。
-
-当前契约：
-
-- Kotlin 侧仍复用 `MainActivity` 中的数据归档选择器入口，返回 `content://` 给前端桥；
-- 前端 `android-archive-service.js` 只在 Skill 导入场景把该 URI 物化到 app cache/temp 下的 `tauritavern-skill-import-staging`；
-- `api.skill.pickImportArchive()` 对 UI 返回 `{ kind: 'archiveFile', path }`，保持 Skill 后端只消费普通文件路径；
-- 如果用户放弃本次导入，UI 必须调用 `api.skill.discardPickedImport(input)` 清理 staged 文件；`installImport()` 完成后会自动清理。
-
-维护原则：
-
-- 不把 `content://` 透传到 Rust Skill repository；仓储层只处理真实路径与归档内容。
-- 导入不把完整文件整体 base64 物化，避免把内存占用集中到 JS heap 与单个 IPC payload。
-- 选择器取消不是错误；staging、预览、安装、清理失败都应直接暴露，避免静默遗留坏状态。
-
----
+图片长按保存：Android WebView 没有图片上下文菜单，由 `download-bridge.js` 在页面层补上 `<img>` 的 `contextmenu` 默认行为，契约见 [FrontendHostContract §5.7](FrontendHostContract.md)。之所以放在页面层，是因为原生长按菜单会先消费长按，页面和扩展就收不到 `contextmenu`。Chromium 将来如果默认提供图片菜单，这一补充即可删除。
 
 ## 11. Android 大型 byte ingress
 
-Tauri 2.10.2 在 Android 上不支持 `InvokeBody::Raw`。业务 payload 进入完整 invoke envelope 后，nested `Uint8Array` 会被 JSON serializer 展开为 `number[]`；大型 payload 会因此产生不可接受的逐 byte 对象化内存开销。
+Tauri Android 当前不支持 raw byte invoke；嵌套 `Uint8Array` 会被编码为数字数组，放大内存占用。
 
-聊天 full-save 的正式契约是：
+聊天与世界书使用[共享提交会话](CurrentState/ChatPayload.md#3-统一聊天提交)：
 
-```text
-begin_chat_commit(logical target, force)
-  -> bounded append_chat_commit_chunk
-     -> Android: { data: base64 }, one-in-flight
-     -> Desktop/iOS: root raw Uint8Array
-  -> finish_chat_commit(expectedSize, commitReason)
-  -> target-local strict rename publish
+- 按 host 帧上限仅编码当前帧的 base64，收到 ACK 后再发送下一帧；失败不回退 raw 传输。
+- 前端只持有会话 ID，暂存与目标路径由 Rust 管理。
+- 普通文件上传与 Blob 导出使用 `stage_file_*`，不承担文档发布。
+
+升级 Tauri 后需在真机验证传输支持，不能仅依据 API 类型判断。
+
+## 12. LAN Sync 多播发现
+
+Android 的 Rust mDNS 发现需要 `CHANGE_WIFI_MULTICAST_STATE` 权限。宿主只在 Activity 处于前台时持有 `MulticastLock`：停止发现或插件收到 `onPause(activity)` 时释放，Activity resume 后由 Rust 为已启动的发现重新获取；网络逻辑由 Rust 负责。插件构造参数保持 `Activity`，与 Tauri 的 JNI 加载签名一致。
+
+平台适配见 [LanDiscoveryPlugin](../src-tauri/crates/tauritavern/gen/android/app/src/main/java/com/tauritavern/client/LanDiscoveryPlugin.kt)，功能边界见[同步总览](CurrentState/Sync.md)。
+
+## 13. Tauri Pilot
+
+`pnpm run android:dev:pilot` 构建带 Pilot 的 debug 包。插件在应用内监听 abstract socket，名字随每次启动变化，CLI 无法自动发现；页面加载后转发到私有目录，并用 `TAURI_PILOT_SOCKET` 指给 CLI：
+
+```bash
+name=$(adb shell cat /proc/net/unix | grep -o 'tauri-pilot-com\.tauritavern\.-[0-9a-f]*\.sock' | tail -1)
+dir=$(mktemp -d /tmp/tauri-pilot.XXXXXX)
+adb forward "localfilesystem:$dir/pilot.sock" "localabstract:$name"
+export TAURI_PILOT_SOCKET="$dir/pilot.sock"
+tauri-pilot ping
 ```
 
-维护原则：
-
-- Android 的大型 JS -> Rust bytes 不得以 raw/numeric-array payload 穿过 Tauri invoke。
-- base64 只能按 host 返回的 frame cap 逐帧生成和发送，不得先物化完整文件的 base64 表示。
-- 每个文件严格逐帧 await，并校验 raw byte offset ACK 与 finish size；失败不得回退旧 plugin-fs raw 路径。
-- renderer 只持有 opaque session ID，不接收 staging/target host path；Rust repository 在目标卷的 `.staging/chat-commits` 内独占 staging 生命周期。
-- finish 只允许 strict rename；失败显式返回，不得 copy 到 current。启动时仅清理该专用 staging 子树。
-- generic `stage_upload_*` 继续服务 avatar、import 与普通 Blob 物化，不参与聊天 full-save。
-- bounded base64 达到实机目标后即停止；只有 profile 证明其仍是主要热点时，才评估 text frame 或 AndroidX binary bridge。
-
-Tauri 版本升级后也必须重新验证运行时 envelope，不能仅凭 API 表面接受 `Uint8Array` 就假定 Android Raw IPC 已可用。
+应用重启后旧转发失效，重新执行以上命令；结束时 `adb forward --remove "localfilesystem:$dir/pilot.sock"` 并删除该目录。多台设备时给每条 `adb` 命令加 `-s <serial>`。Android 上没有 `press`，文字输入用 `fill` 或 `type`。

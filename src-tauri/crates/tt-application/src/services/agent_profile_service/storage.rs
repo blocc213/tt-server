@@ -42,12 +42,13 @@ impl AgentProfileService {
         if profile.is_none() && id.as_str() == DEFAULT_AGENT_PROFILE_ID {
             return Ok(Some(default_writer_profile()?));
         }
-        profile
-            .map(|mut profile| {
-                migrate_profile_schema(&mut profile)?;
-                Ok(profile)
-            })
-            .transpose()
+        let Some(mut profile) = profile else {
+            return Ok(None);
+        };
+        if migrate_profile_schema(&mut profile)? {
+            self.profile_repository.save_profile(&profile).await?;
+        }
+        Ok(Some(profile))
     }
 
     pub async fn save_profile(
@@ -55,7 +56,7 @@ impl AgentProfileService {
         mut profile: AgentProfileDefinition,
         tool_catalog: &tt_domain::models::tool::ToolCatalog,
     ) -> Result<(), ApplicationError> {
-        migrate_profile_schema(&mut profile)?;
+        let _ = migrate_profile_schema(&mut profile)?;
         normalize_context_policy(&mut profile.context)?;
         self.resolve_definition(
             profile.clone(),
@@ -68,6 +69,35 @@ impl AgentProfileService {
             .save_profile(&profile)
             .await
             .map_err(ApplicationError::from)
+    }
+
+    pub async fn load_session_profile(
+        &self,
+    ) -> Result<Option<AgentProfileDefinition>, ApplicationError> {
+        let Some(mut profile) = self.session_repository.load_session_profile().await? else {
+            return Ok(None);
+        };
+        if migrate_profile_schema(&mut profile)? {
+            self.session_repository
+                .save_session_profile(&profile)
+                .await?;
+        }
+        Ok(Some(profile))
+    }
+
+    pub async fn save_session_profile(
+        &self,
+        mut profile: AgentProfileDefinition,
+        tool_catalog: &tt_domain::models::tool::ToolCatalog,
+    ) -> Result<(), ApplicationError> {
+        let _ = migrate_profile_schema(&mut profile)?;
+        normalize_context_policy(&mut profile.context)?;
+        self.resolve_session_profile(profile.clone(), tool_catalog)
+            .await?;
+        self.session_repository
+            .save_session_profile(&profile)
+            .await?;
+        Ok(())
     }
 
     pub async fn delete_profile(&self, profile_id: &str) -> Result<(), ApplicationError> {

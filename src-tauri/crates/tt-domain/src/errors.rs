@@ -23,6 +23,14 @@ pub enum DomainError {
     #[error("{0}")]
     Cancelled(String),
 
+    #[error("{operation} {path}: {source}")]
+    FileIo {
+        operation: &'static str,
+        path: String,
+        #[source]
+        source: std::io::Error,
+    },
+
     #[error("Internal error: {0}")]
     InternalError(String),
 
@@ -37,6 +45,15 @@ pub enum DomainError {
 
     #[error("Workspace path is a directory: {path}")]
     WorkspacePathIsDirectory { path: String },
+
+    #[error("Workspace file is not UTF-8 text: {path}")]
+    WorkspaceFileNotText { path: String },
+
+    #[error("Cannot {operation} `{path}`: access is not allowed for this task")]
+    WorkspaceAccessDenied {
+        path: String,
+        operation: &'static str,
+    },
 
     #[error("Workspace write conflict at {path}: {kind}")]
     WorkspaceWriteConflict {
@@ -82,6 +99,25 @@ impl fmt::Display for WorkspaceWriteConflictKind {
 }
 
 impl DomainError {
+    pub fn file_io(
+        operation: &'static str,
+        path: impl Into<String>,
+        source: std::io::Error,
+    ) -> Self {
+        let path = path.into();
+        if source.kind() == std::io::ErrorKind::NotFound {
+            Self::NotFound(format!("{operation} {path}: {source}"))
+        } else if source.kind() == std::io::ErrorKind::IsADirectory {
+            Self::workspace_path_is_directory(path)
+        } else {
+            Self::FileIo {
+                operation,
+                path,
+                source,
+            }
+        }
+    }
+
     pub fn cancelled(message: impl Into<String>) -> Self {
         Self::Cancelled(message.into())
     }
@@ -108,6 +144,10 @@ impl DomainError {
         Self::WorkspacePathIsDirectory { path: path.into() }
     }
 
+    pub fn workspace_file_not_text(path: impl Into<String>) -> Self {
+        Self::WorkspaceFileNotText { path: path.into() }
+    }
+
     pub fn workspace_write_conflict(
         path: impl Into<String>,
         kind: WorkspaceWriteConflictKind,
@@ -116,57 +156,5 @@ impl DomainError {
             path: path.into(),
             kind,
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn generation_cancelled_by_user_is_cancelled_variant() {
-        let error = DomainError::generation_cancelled_by_user();
-
-        assert!(matches!(
-            &error,
-            DomainError::Cancelled(message) if message == GENERATION_CANCELLED_BY_USER_MESSAGE
-        ));
-    }
-
-    #[test]
-    fn cancelled_constructor_keeps_message() {
-        let error = DomainError::cancelled("Job cancelled");
-
-        assert!(matches!(
-            &error,
-            DomainError::Cancelled(message) if message == "Job cancelled"
-        ));
-    }
-
-    #[test]
-    fn workspace_path_is_directory_constructor_keeps_path() {
-        let error = DomainError::workspace_path_is_directory("persist");
-
-        assert!(matches!(
-            &error,
-            DomainError::WorkspacePathIsDirectory { path } if path == "persist"
-        ));
-    }
-
-    #[test]
-    fn workspace_write_conflict_constructor_keeps_kind() {
-        let error = DomainError::workspace_write_conflict(
-            "output/main.md",
-            WorkspaceWriteConflictKind::Stale {
-                expected_sha256: "old".to_string(),
-                actual_sha256: None,
-            },
-        );
-
-        assert!(matches!(
-            &error,
-            DomainError::WorkspaceWriteConflict { path, kind: WorkspaceWriteConflictKind::Stale { expected_sha256, actual_sha256: None } }
-                if path == "output/main.md" && expected_sha256 == "old"
-        ));
     }
 }

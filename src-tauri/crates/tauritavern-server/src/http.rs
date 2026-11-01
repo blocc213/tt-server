@@ -79,7 +79,7 @@ pub fn router(state: SharedState) -> Router {
             post(upload_user_file).layer(DefaultBodyLimit::max(MAX_USER_FILE_UPLOAD_BYTES)),
         )
         .route("/rpc/{command}", post(rpc))
-        .route("/rpc-raw/stage_upload_chunk", post(stage_upload_chunk))
+        .route("/rpc-raw/{command}", post(rpc_raw))
         .route("/api/logout", post(logout))
         .fallback(crate::resource::serve)
         .layer(middleware::from_fn_with_state(
@@ -145,7 +145,9 @@ async fn logout(State(state): State<SharedState>, request: Request) -> Response 
         .and_then(session_token_from_cookies)
     {
         state.auth.logout(token);
+        state.browser_resources.close_session(token);
     }
+    if state.auth.is_open() { state.browser_resources.close_session("open"); }
 
     let mut response = Json(json!({ "ok": true })).into_response();
     if let Ok(cookie) = HeaderValue::from_str(&format!("{SESSION_COOKIE}=; Path=/; Max-Age=0")) {
@@ -156,21 +158,18 @@ async fn logout(State(state): State<SharedState>, request: Request) -> Response 
 
 async fn require_session(
     State(state): State<SharedState>,
-    request: Request,
+    mut request: Request,
     next: Next,
 ) -> Response {
-    if state.auth.is_open() {
-        return next.run(request).await;
-    }
-
-    let authorized = request
-        .headers()
-        .get(header::COOKIE)
-        .and_then(|value| value.to_str().ok())
-        .and_then(session_token_from_cookies)
-        .is_some_and(|token| state.auth.is_valid_session(token));
-
-    if authorized {
+    let token = request.headers().get(header::COOKIE).and_then(|value|value.to_str().ok())
+        .and_then(session_token_from_cookies).map(str::to_owned);
+    if state.auth.is_open() || token.as_deref().is_some_and(|token|state.auth.is_valid_session(token)) {
+        let client = request.headers().get("x-tauritavern-client-id").and_then(|v|v.to_str().ok()).unwrap_or("legacy");
+        if client.len() > 128 || !client.bytes().all(|c|c.is_ascii_alphanumeric() || c==b'-' || c==b'_') {
+            return ServerError::BadRequest("Invalid browser client id".into()).into_response();
+        }
+        let owner = crate::browser_resources::RequestOwner(format!("{}:{client}",token.as_deref().unwrap_or("open")));
+        request.extensions_mut().insert(owner);
         return next.run(request).await;
     }
 
@@ -203,50 +202,35 @@ async fn csrf_token(State(state): State<SharedState>) -> Json<Value> {
 }
 
 async fn bootstrap(State(state): State<SharedState>) -> Result<Json<Value>, ServerError> {
-    let value = crate::rpc::dispatch(&state, "get_bootstrap_snapshot", Value::Null)
+    let value = crate::rpc::dispatch(&state, "get_bootstrap_metadata", Value::Null)
         .await
         .ok_or_else(|| ServerError::Internal("Bootstrap command is not registered".into()))??;
     Ok(Json(value))
 }
 
-async fn stage_upload_chunk(
+async fn rpc_raw(
     State(state): State<SharedState>,
+    axum::Extension(owner): axum::Extension<crate::browser_resources::RequestOwner>,
+    axum::extract::Path(command): axum::extract::Path<String>,
     headers: http::HeaderMap,
     body: Bytes,
-) -> Result<Json<Value>, ServerError> {
-    let file_path = required_header(&headers, "file-path")?;
-    let file_path = percent_encoding::percent_decode_str(&file_path)
-        .decode_utf8()
-        .map_err(|_| ServerError::BadRequest("Upload file path is not UTF-8".into()))?
-        .into_owned();
-    let offset = required_header(&headers, "offset")?
-        .parse::<u64>()
-        .map_err(|_| ServerError::BadRequest("Upload offset is invalid".into()))?;
-
-    let next_offset = state
-        .upload_staging
-        .append(&file_path, offset, &body)
-        .await?;
-    Ok(Json(json!(next_offset)))
+) -> Result<Response, ServerError> {
+    crate::rpc_bytes::raw(&state, &owner.0, &command, &headers, &body).await
 }
 
-fn required_header(headers: &http::HeaderMap, name: &'static str) -> Result<String, ServerError> {
-    headers
-        .get(name)
-        .and_then(|value| value.to_str().ok())
-        .map(ToString::to_string)
-        .ok_or_else(|| ServerError::BadRequest(format!("Missing header `{name}`")))
-}
 
 async fn rpc(
     State(state): State<SharedState>,
     axum::extract::Path(command): axum::extract::Path<String>,
+    axum::Extension(owner): axum::Extension<crate::browser_resources::RequestOwner>,
     body: Option<Json<Value>>,
-) -> Result<Json<Value>, ServerError> {
+) -> Result<Response, ServerError> {
     let args = body.map(|Json(value)| value).unwrap_or(Value::Null);
+    if let Some(result) = crate::rpc_bytes::dispatch(&state, &owner.0, &command, &args).await { return result; }
+    if let Some(result) = crate::rpc_services::dispatch(&state, &command, args.clone()).await { return result.map(|value|Json(value).into_response()); }
 
     match crate::rpc::dispatch(&state, &command, args).await {
-        Some(result) => Ok(Json(result?)),
+        Some(result) => Ok(Json(result?).into_response()),
         None => Err(ServerError::NotFound(format!(
             "Command `{command}` is not available in server mode"
         ))),
@@ -255,11 +239,13 @@ async fn rpc(
 
 async fn upload_user_file(
     State(state): State<SharedState>,
+    axum::Extension(owner): axum::Extension<crate::browser_resources::RequestOwner>,
     body: Option<Json<Value>>,
-) -> Result<Json<Value>, ServerError> {
+) -> Result<Response, ServerError> {
     rpc(
         State(state),
         axum::extract::Path("upload_user_file".to_string()),
+        axum::Extension(owner),
         body,
     )
     .await
@@ -334,7 +320,7 @@ mod tests {
         let root = std::env::temp_dir().join(format!("tt-body-limit-{}", rand::random::<u64>()));
         let services = crate::composition::build(
             &root,
-            root.join("resources"),
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../.."),
             Default::default(),
             crate::product::USER_AGENT,
         )
@@ -346,6 +332,8 @@ mod tests {
             frontend_dir: root.join("frontend"),
             csrf_token: "test".into(),
             upload_staging: Arc::new(crate::upload::UploadStaging::new(&root)),
+            browser_resources: Default::default(),
+            templates: Default::default(),
         });
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await

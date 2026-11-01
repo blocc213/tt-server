@@ -1,11 +1,12 @@
 use std::path::Path;
 use std::sync::Arc;
+use tt_ports::byte_reader::ByteReader;
 
 use serde_json::Value;
 
 use crate::dto::chat_dto::{
-    AddMessageDto, ChatDto, ChatSearchResultDto, CreateChatDto, ExportChatDto,
-    ImportCharacterChatsDto, ImportChatDto, RenameChatDto, RestoreCharacterChatBackupDto,
+    AddMessageDto, ChatDto, ChatSearchResultDto, CreateChatDto, ImportCharacterChatsDto,
+    ImportChatDto, RenameChatDto, RestoreCharacterChatBackupDto,
 };
 use crate::dto::chat_history_dto::{ChatHistoryLocator, CurrentCommitReason};
 use crate::errors::ApplicationError;
@@ -22,7 +23,9 @@ use tt_ports::repositories::agent_workspace_lifecycle_repository::{
     AgentPersistentStatePrune, AgentPersistentStatePruneRequest,
 };
 use tt_ports::repositories::character_repository::CharacterRepository;
-use tt_ports::repositories::chat_repository::{ChatExportFormat, ChatImportFormat, ChatRepository};
+use tt_ports::repositories::chat_repository::{
+    ChatBackupCatalogEntry, ChatImportFormat, ChatRepository,
+};
 use tt_ports::repositories::chat_types::{
     ChatMessageSearchHit, ChatMessageSearchQuery, ChatPayloadChunk, ChatPayloadCursor,
     ChatPayloadTail, FindLastMessageQuery, LocatedChatMessage, PinnedCharacterChat,
@@ -213,19 +216,25 @@ impl ChatService {
         file_name: &str,
     ) -> Result<(), ApplicationError> {
         tracing::info!("Deleting chat: {}/{}", character_name, file_name);
+        let _run_guard = self
+            .agent_workspace_lifecycle_service
+            .lock_run_lifecycle()
+            .await;
 
-        let summary = self
+        let integrity = self
             .chat_repository
-            .get_character_chat_summary(character_name, file_name, true)
+            .get_character_chat_integrity(character_name, file_name)
             .await?;
-        let target = match summary.chat_metadata.as_ref() {
-            Some(metadata) => AgentWorkspaceLifecycleService::character_target_from_metadata(
-                character_name,
-                file_name,
-                metadata,
-            )?,
-            None => None,
-        };
+        let target = integrity
+            .as_deref()
+            .map(|integrity| {
+                AgentWorkspaceLifecycleService::character_target(
+                    character_name,
+                    file_name,
+                    integrity,
+                )
+            })
+            .transpose()?;
         if let Some(target) = target.as_ref() {
             self.agent_workspace_lifecycle_service
                 .ensure_chat_workspace_inactive(target)
@@ -239,10 +248,15 @@ impl ChatService {
             .invalidate(&character_locator(character_name, file_name))
             .await;
 
-        if let Some(target) = target {
-            self.agent_workspace_lifecycle_service
-                .delete_chat_workspace(&target)
-                .await?;
+        if let Some(target) = target
+            && let Err(error) = self
+                .cleanup_deleted_chat_workspace(character_name, &target)
+                .await
+        {
+            tracing::error!(
+                target: tt_contracts::observability::USER_VISIBLE_ERROR,
+                "Deleted chat '{character_name}/{file_name}' but could not clean its Agent workspace: {error}"
+            );
         }
 
         Ok(())
@@ -323,31 +337,6 @@ impl ChatService {
         Ok(ChatDto::from(chat))
     }
 
-    /// Export a chat
-    pub async fn export_chat(&self, dto: ExportChatDto) -> Result<(), ApplicationError> {
-        tracing::info!(
-            "Exporting chat: {}/{} to {}",
-            dto.character_name,
-            dto.file_name,
-            dto.target_path
-        );
-
-        // Convert the format string to enum
-        let format = ChatExportFormat::from(dto.format);
-
-        // Export the chat
-        self.chat_repository
-            .export_chat(
-                &dto.character_name,
-                &dto.file_name,
-                Path::new(&dto.target_path),
-                format,
-            )
-            .await?;
-
-        Ok(())
-    }
-
     /// Backup a chat
     pub async fn backup_chat(
         &self,
@@ -371,43 +360,30 @@ impl ChatService {
         Ok(results.into_iter().map(ChatSearchResultDto::from).collect())
     }
 
-    /// Decode a chat backup into a temporary JSONL file for streaming consumers.
-    pub async fn materialize_chat_backup(
+    /// List chat backup metadata without reading backup payloads.
+    pub async fn list_chat_backup_catalog(
+        &self,
+    ) -> Result<Vec<ChatBackupCatalogEntry>, ApplicationError> {
+        tracing::info!("Listing chat backup catalog");
+
+        Ok(self.chat_repository.list_chat_backup_catalog().await?)
+    }
+
+    /// Open the decoded JSONL payload of a logical chat backup.
+    pub async fn open_chat_backup_download(
         &self,
         backup_file_name: &str,
-    ) -> Result<String, ApplicationError> {
+    ) -> Result<Box<dyn ByteReader>, ApplicationError> {
         if backup_file_name.trim().is_empty() {
             return Err(ApplicationError::ValidationError(
                 "Backup file name cannot be empty".to_string(),
             ));
         }
 
-        let path = self
+        Ok(self
             .chat_repository
-            .materialize_chat_backup(backup_file_name)
-            .await?;
-        path.into_os_string().into_string().map_err(|_| {
-            ApplicationError::InternalError(
-                "Chat backup materialization path is not valid UTF-8".to_string(),
-            )
-        })
-    }
-
-    /// Remove a temporary JSONL backup materialization.
-    pub async fn discard_chat_backup_materialization(
-        &self,
-        path: &str,
-    ) -> Result<(), ApplicationError> {
-        if path.trim().is_empty() {
-            return Err(ApplicationError::ValidationError(
-                "Backup materialization path cannot be empty".to_string(),
-            ));
-        }
-
-        self.chat_repository
-            .discard_chat_backup_materialization(Path::new(path))
-            .await?;
-        Ok(())
+            .open_chat_backup_download(backup_file_name)
+            .await?)
     }
 
     /// Restore a character chat directly from a history backup.
@@ -464,6 +440,17 @@ impl ChatService {
         Ok(ChatSearchResultDto::from(summary))
     }
 
+    pub async fn get_character_chat_integrity(
+        &self,
+        character_name: &str,
+        file_name: &str,
+    ) -> Result<Option<String>, ApplicationError> {
+        Ok(self
+            .chat_repository
+            .get_character_chat_integrity(character_name, file_name)
+            .await?)
+    }
+
     pub async fn get_character_chat_metadata(
         &self,
         character_name: &str,
@@ -473,21 +460,6 @@ impl ChatService {
             .chat_repository
             .get_character_chat_metadata(character_name, file_name)
             .await?)
-    }
-
-    pub async fn set_character_chat_metadata_extension(
-        &self,
-        character_name: &str,
-        file_name: &str,
-        namespace: &str,
-        value: Value,
-    ) -> Result<(), ApplicationError> {
-        self.chat_repository
-            .set_character_chat_metadata_extension(character_name, file_name, namespace, value)
-            .await?;
-        self.note_current_committed(character_name, file_name, CurrentCommitReason::Mutation)
-            .await;
-        Ok(())
     }
 
     pub async fn get_character_chat_store_json(
@@ -647,6 +619,34 @@ impl ChatService {
         self.agent_workspace_lifecycle_service
             .prune_persistent_states(target, request)
             .await
+    }
+
+    pub async fn copy_agent_persistent_states(
+        &self,
+        source: &AgentChatWorkspaceTarget,
+        target: &AgentChatWorkspaceTarget,
+    ) -> Result<(), ApplicationError> {
+        self.agent_workspace_lifecycle_service
+            .copy_persistent_states(source, target)
+            .await
+    }
+
+    async fn cleanup_deleted_chat_workspace(
+        &self,
+        character_name: &str,
+        target: &AgentChatWorkspaceTarget,
+    ) -> Result<(), ApplicationError> {
+        if self
+            .chat_repository
+            .has_character_chat_with_integrity(character_name, &target.stable_chat_id)
+            .await?
+        {
+            return Ok(());
+        }
+        self.agent_workspace_lifecycle_service
+            .delete_chat_workspace_locked(target)
+            .await
+            .map(|_| ())
     }
 
     /// Get the tail window for a character chat JSONL payload.

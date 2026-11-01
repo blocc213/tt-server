@@ -68,20 +68,25 @@ async fn serve_frontend_file(root: &Path, uri: &Uri) -> Response {
     }
 
     let path = root.join(&relative);
-    let metadata = match tokio::fs::metadata(&path).await {
-        Ok(metadata) if metadata.is_file() => metadata,
+    match tokio::fs::metadata(&path).await {
+        Ok(metadata) if metadata.is_file() => (),
         _ => return StatusCode::NOT_FOUND.into_response(),
     };
 
-    let body = match tokio::fs::read(&path).await {
+    let mut body = match tokio::fs::read(&path).await {
         Ok(body) => body,
         Err(error) => {
             tracing::error!(path = %path.display(), %error, "Failed to read frontend asset");
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
     };
+    if relative == Path::new("index.html") {
+        let html = String::from_utf8_lossy(&body);
+        body = html.replacen("<head>", "<head><script>globalThis.__TAURITAVERN_HOST__={platform:'browser',kind:'server'};globalThis.__TAURITAVERN_SERVER__=true;</script>", 1).into_bytes();
+    }
 
     let content_type = mime_guess::from_path(&path).first_or_octet_stream();
+    let body_length = body.len();
     let mut response = Response::new(Body::from(body));
     *response.status_mut() = StatusCode::OK;
     response.headers_mut().insert(
@@ -91,7 +96,7 @@ async fn serve_frontend_file(root: &Path, uri: &Uri) -> Response {
     );
     response.headers_mut().insert(
         http::header::CONTENT_LENGTH,
-        http::HeaderValue::from_str(&metadata.len().to_string())
+        http::HeaderValue::from_str(&body_length.to_string())
             .unwrap_or_else(|_| http::HeaderValue::from_static("0")),
     );
     response

@@ -21,8 +21,6 @@ test('server-native routes bypass the in-page router in server mode', async () =
         for (const path of [
             '/csrf-token',
             '/api/bootstrap',
-            '/api/chats/get',
-            '/api/chats/save',
             '/api/backends/chat-completions/generate',
             '/api/backends/chat-completions/status',
         ]) {
@@ -52,6 +50,8 @@ test('server mode keeps non-native upstream routes in-page', async () => {
         assert.equal(shouldHandleInPage('/api/settings/get'), true);
         assert.equal(shouldHandleInPage('/api/characters/all'), true);
         assert.equal(shouldHandleInPage('/api/worldinfo/get'), true);
+        assert.equal(shouldHandleInPage('/api/chats/get'), true);
+        assert.equal(shouldHandleInPage('/api/chats/save'), true);
         // Same prefix as the native chat-completion endpoints, but only the
         // page implements these; a prefix match used to strand them on a 404.
         assert.equal(shouldHandleInPage('/api/backends/chat-completions/bias'), true);

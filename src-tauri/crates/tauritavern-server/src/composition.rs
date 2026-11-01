@@ -47,7 +47,7 @@ use tt_application::services::background_service::BackgroundService;
 use tt_application::services::character_service::CharacterService;
 use tt_application::services::chat_completion_service::ChatCompletionService;
 use tt_application::services::chat_history_coordinator::ChatHistoryCoordinator;
-use tt_application::services::chat_payload_commit_service::ChatPayloadCommitService;
+use tt_application::services::chat_commit_service::ChatCommitService;
 use tt_application::services::chat_service::ChatService;
 use tt_application::services::content_service::ContentService;
 use tt_application::services::data_archive_service::{DataArchiveJobRegistry, DataArchiveService};
@@ -58,7 +58,6 @@ use tt_application::services::group_service::GroupService;
 use tt_application::services::host_resource_service::HostResourceService;
 use tt_application::services::image_metadata_service::ImageMetadataService;
 use tt_application::services::llm_connection_service::LlmConnectionService;
-use tt_application::services::native_regex_service::NativeRegexService;
 use tt_application::services::preset_service::PresetService;
 use tt_application::services::prompt_assembly_service::PromptAssemblyService;
 use tt_application::services::provider_metadata_service::ProviderMetadataService;
@@ -97,7 +96,7 @@ pub struct ServerServices {
     pub translate_service: Arc<TranslateService>,
     pub tts_service: Arc<TtsService>,
     pub chat_history_coordinator: Arc<ChatHistoryCoordinator>,
-    pub chat_payload_commit_service: Arc<ChatPayloadCommitService>,
+    pub chat_commit_service: Arc<ChatCommitService>,
     pub settings_service: Arc<SettingsService>,
     pub secret_service: Arc<SecretService>,
     pub skill_service: Arc<SkillService>,
@@ -121,12 +120,20 @@ pub struct ServerServices {
     pub llm_connection_service: Arc<LlmConnectionService>,
     pub tokenization_service: Arc<TokenizationService>,
     pub world_info_service: Arc<WorldInfoService>,
-    pub native_regex_service: Arc<NativeRegexService>,
     pub host_resource_service: Arc<HostResourceService>,
     pub user_file_service: Arc<UserFileService>,
     pub data_archive_service: Arc<DataArchiveService>,
     pub ios_policy: IosPolicyActivationReport,
+    pub sprite_service: Arc<tt_application::services::sprite_service::SpriteService>,
+    pub mcp_service: Arc<tt_application::services::mcp_service::McpService>,
+    pub searxng_search_service: Arc<tt_application::services::searxng_search_service::SearxngSearchService>,
+    pub vector_service: Arc<tt_application::services::vector_service::VectorService>,
+    pub database_service: Arc<tt_application::services::database_service::DatabaseService>,
+    pub user_endpoint_access_service: Arc<tt_application::services::user_endpoint_access_service::UserEndpointAccessService>,
+    pub archive_files: Arc<ServerDataArchiveFiles>,
 }
+
+const COMMIT_FRAME_BYTES: u64 = 4 * 1024 * 1024;
 
 pub async fn build(
     data_root: &Path,
@@ -137,13 +144,14 @@ pub async fn build(
     let data_directory = DataDirectory::new(data_root.to_path_buf());
     data_directory.initialize().await?;
 
-    let resources = Arc::new(DirectoryResourceStore::new(resource_root));
+    let resources = Arc::new(DirectoryResourceStore::new(resource_root.clone()));
     let http_client_pool = Arc::new(HttpClientPool::new(user_agent));
     http_client_pool.apply_request_proxy_settings(&settings.request_proxy)?;
 
     let data_root = data_directory.root().to_path_buf();
     let default_user_dir = data_directory.default_user().to_path_buf();
     let chat_aliases = new_shared_chat_alias_store_for_user_dir(data_directory.default_user());
+    let page_generation = Arc::new(tt_adapter_storage_core::commit_stage::PageGeneration::default());
 
     let file_chat_repository = Arc::new(FileChatRepository::with_chat_aliases_and_backup_settings(
         data_directory.characters().to_path_buf(),
@@ -152,13 +160,10 @@ pub async fn build(
         data_directory.backups().to_path_buf(),
         chat_aliases.clone(),
         settings.chat_backups,
+        page_generation.clone(),
+        COMMIT_FRAME_BYTES,
     ));
-    if let Err(error) = file_chat_repository
-        .cleanup_orphaned_chat_commit_staging()
-        .await
-    {
-        tracing::warn!(%error, "Failed to clean orphaned chat commit staging");
-    }
+    file_chat_repository.cleanup_orphaned_chat_commit_staging().await;
 
     let character_repository = Arc::new(FileCharacterRepository::with_chat_repository(
         data_directory.characters().to_path_buf(),
@@ -178,15 +183,28 @@ pub async fn build(
         default_user_dir.clone(),
         content_repository.clone(),
     ));
+    use tt_ports::bundled_resource::BundledResourceStore;
+    let defaults = serde_json::from_slice(&resources.read_bytes("default/content/settings.json")?)
+        .map_err(|error| DomainError::InvalidData(format!("Invalid bundled settings: {error}")))?;
     let settings_repository = Arc::new(FileSettingsRepository::new(
-        data_directory.settings().to_path_buf(),
+        data_directory.settings().to_path_buf(), defaults, settings.clone(),
+        page_generation.clone(), COMMIT_FRAME_BYTES,
     ));
+    settings_repository.cleanup_orphaned_commit_staging().await;
+    use tt_ports::repositories::settings_repository::SettingsRepository;
+    settings_repository.load_user_settings().await?;
+    let persona_root = default_user_dir.clone();
+    tokio::task::spawn_blocking(move || {
+        tt_adapter_media::persona_cards::migrate_personas(&persona_root, &persona_root)
+    }).await.map_err(|error| DomainError::InternalError(error.to_string()))??;
     let secret_repository = Arc::new(FileSecretRepository::new(
         default_user_dir.join("secrets.json"),
     ));
     let world_info_repository = Arc::new(FileWorldInfoRepository::new(
         data_directory.default_user().join("worlds"),
+        page_generation.clone(), COMMIT_FRAME_BYTES,
     ));
+    world_info_repository.cleanup_orphaned_commit_staging().await;
     let file_agent_repository = Arc::new(FileAgentRepository::new(
         data_root.join("_tauritavern").join("agent-workspaces"),
     ));
@@ -196,21 +214,28 @@ pub async fn build(
     let llm_connection_repository = Arc::new(FileLlmConnectionRepository::new(
         data_root.join("_tauritavern").join("llm-connections"),
     ));
+    let builtin_skills = resource_root.join("default/skills");
+    if !builtin_skills.is_dir() {
+        return Err(DomainError::NotFound(format!("Packaged builtin Skills directory not found: {}", builtin_skills.display())));
+    }
     let skill_repository = Arc::new(FileSkillRepository::new(
         data_root.join("_tauritavern").join("skills"),
+        builtin_skills,
     ));
     let prompt_cache_repository = Arc::new(FilePromptCacheRepository::new(
         data_root.join("_tauritavern").join("prompt-cache"),
     ));
 
     let chat_completion_repository =
-        Arc::new(HttpChatCompletionRepository::new(http_client_pool.clone()));
+        Arc::new(crate::llm_logging::ConsoleChatCompletionRepository::new(
+            Arc::new(HttpChatCompletionRepository::new(http_client_pool.clone())),
+        ));
     let provider_metadata_service = Arc::new(ProviderMetadataService::new(
         Arc::new(HttpProviderMetadataRepository::new(
             http_client_pool.clone(),
         )),
         secret_repository.clone(),
-        resolve_ios_policy_activation_report(IosPolicyScope::Ignored, None)?,
+        resolve_ios_policy_activation_report(IosPolicyScope::Ignored, None, None)?,
     ));
     let stable_diffusion_service = Arc::new(StableDiffusionService::new(
         Arc::new(HttpStableDiffusionRepository::new(
@@ -254,9 +279,12 @@ pub async fn build(
         )),
         local_mutation_gate,
     ));
-    let extension_store_service = Arc::new(ExtensionStoreService::new(Arc::new(
-        FileExtensionStoreRepository::new(data_root.join("_tauritavern").join("extension-store")),
-    )));
+    let extension_store_repository = Arc::new(FileExtensionStoreRepository::new(
+        data_root.join("_tauritavern").join("extension-store"),
+        data_root.join(".staging/extension-store"), page_generation, COMMIT_FRAME_BYTES,
+    ));
+    extension_store_repository.cleanup_orphaned_commit_staging().await;
+    let extension_store_service = Arc::new(ExtensionStoreService::new(extension_store_repository));
     let avatar_service = Arc::new(AvatarService::new(Arc::new(FileAvatarRepository::new(
         default_user_dir.join("User Avatars"),
     ))));
@@ -283,22 +311,54 @@ pub async fn build(
         skill_repository,
         Arc::new(HttpExternalImportDownloader::new(http_client_pool.clone())),
     ));
-    let llm_connection_service = Arc::new(LlmConnectionService::new(llm_connection_repository));
+    let llm_connection_service = Arc::new(LlmConnectionService::new(llm_connection_repository, settings_repository.clone()));
     // The server never runs under the iOS distribution policy; take the unrestricted
     // baseline rather than inventing a server-specific capability matrix.
-    let ios_policy = resolve_ios_policy_activation_report(IosPolicyScope::Ignored, None)?;
+    let ios_policy = resolve_ios_policy_activation_report(IosPolicyScope::Ignored, None, None)?;
     let chat_completion_service = Arc::new(ChatCompletionService::new(
         chat_completion_repository,
         secret_repository.clone(),
         settings_repository.clone(),
         prompt_cache_repository,
+        None,
         ios_policy.clone(),
     ));
 
+    let tokenization_service = Arc::new(TokenizationService::new(Arc::new(MiktikTokenizerRepository::new(
+        data_root.join("_cache/tokenizers"), http_client_pool.clone(),
+    ))));
+    let user_endpoint_access_service = Arc::new(
+        tt_application::services::user_endpoint_access_service::UserEndpointAccessService::initialize(
+            Arc::new(tt_adapter_storage_core::FileUserEndpointGrantRepository::new(
+                data_root.join(".server-security/user-endpoint-grants.json"),
+            )),
+            http_client_pool.clone(),
+        ).await,
+    );
+    let mcp_service = Arc::new(tt_application::services::mcp_service::McpService::new(
+        Arc::new(tt_adapter_storage_core::FileMcpServerRepository::new(data_root.join("_tauritavern/mcp"))),
+        Arc::new(tt_adapter_mcp::RmcpMcpGateway::new(http_client_pool.clone())),
+    ));
+    let searxng_search_service = Arc::new(tt_application::services::searxng_search_service::SearxngSearchService::new(
+        Arc::new(tt_adapter_provider_http::HttpSearxngSearchRepository::new(http_client_pool.clone())),
+    ));
+    let vector_service = Arc::new(tt_application::services::vector_service::VectorService::new(
+        Arc::new(tt_adapter_vector::RedbVectorRepository::new(default_user_dir.join("vectors/tauritavern-v1.redb"))),
+        Arc::new(tt_adapter_provider_http::HttpEmbeddingRepository::new(http_client_pool.clone())),
+        Arc::new(tt_adapter_vector::CandleLocalEmbeddingRepository::new(data_root.join("_cache/embedding-models"))),
+        secret_repository.clone(), ios_policy.clone(),
+    ));
+    let sprite_service = Arc::new(tt_application::services::sprite_service::SpriteService::new(
+        Arc::new(tt_adapter_storage_userdata::FileSpriteRepository::new(data_directory.characters().to_path_buf())),
+    ));
+    let database_service = Arc::new(tt_application::services::database_service::DatabaseService::new(
+        Arc::new(tt_adapter_triviumdb::TriviumDatabaseBackend::new(data_root.join("_tauritavern/databases"))),
+    ));
     let agent_profile_service = Arc::new(AgentProfileService::new(
         agent_profile_repository.clone(),
         agent_profile_repository,
         preset_repository.clone(),
+        file_agent_repository.clone(),
     ));
     let agent_profile_diagnostic_service = Arc::new(AgentProfileDiagnosticService::new(
         agent_profile_service.clone(),
@@ -324,11 +384,17 @@ pub async fn build(
         agent_profile_service.clone(),
         llm_connection_service.clone(),
         prompt_assembly_service.clone(),
+        mcp_service.clone(),
+        Arc::new(tt_adapter_workspace_shell::WorkspaceShellEngine),
+        Arc::new(crate::browser_resources::NativeExtensionToolsUnavailable),
+        tokenization_service.clone(),
+        Arc::new(tt_adapter_media::MediaToolImageNormalizer),
     ));
     let agent_run_history_service = Arc::new(AgentRunHistoryService::new(
         file_agent_repository.clone(),
         settings_repository.clone(),
         agent_runtime_service.clone() as Arc<dyn AgentRunActivity>,
+        agent_runtime_service.run_lifecycle_lock(),
     ));
     let agent_run_retention_automation_service = Arc::new(AgentRunRetentionAutomationService::new(
         settings_repository.clone(),
@@ -337,13 +403,14 @@ pub async fn build(
     let agent_workspace_lifecycle_service = Arc::new(AgentWorkspaceLifecycleService::new(
         file_agent_repository,
         agent_runtime_service.clone() as Arc<dyn AgentRunActivity>,
+        agent_runtime_service.run_lifecycle_lock(),
     ));
 
     let chat_history_coordinator = Arc::new(ChatHistoryCoordinator::new(
         file_chat_repository.clone(),
         file_chat_repository.clone(),
     ));
-    let chat_payload_commit_service = Arc::new(ChatPayloadCommitService::new(
+    let chat_commit_service = Arc::new(ChatCommitService::new(
         file_chat_repository.clone(),
         chat_history_coordinator.clone(),
     ));
@@ -356,7 +423,7 @@ pub async fn build(
         chat_history_coordinator.clone(),
     ));
     let character_service = Arc::new(CharacterService::new(
-        character_repository,
+        character_repository.clone(),
         file_chat_repository.clone(),
         world_info_repository.clone(),
         agent_workspace_lifecycle_service.clone(),
@@ -364,11 +431,7 @@ pub async fn build(
     ));
     let chat_service = Arc::new(ChatService::new(
         file_chat_repository.clone(),
-        Arc::new(FileCharacterRepository::new(
-            data_directory.characters().to_path_buf(),
-            data_directory.chats().to_path_buf(),
-            data_directory.default_avatar().to_path_buf(),
-        )),
+        character_repository,
         agent_workspace_lifecycle_service.clone(),
         chat_history_coordinator.clone(),
     ));
@@ -383,6 +446,7 @@ pub async fn build(
     ));
     let request_proxy_runtime: Arc<dyn RequestProxyRuntime> = http_client_pool.clone();
     let settings_service = Arc::new(SettingsService::new(
+        Arc::new(FileAvatarRepository::new(default_user_dir.join("User Avatars"))),
         settings_repository,
         request_proxy_runtime,
         file_chat_repository,
@@ -396,11 +460,16 @@ pub async fn build(
     let user_file_service = Arc::new(UserFileService::new(Arc::new(
         FilesystemUserFileStore::new(default_user_dir.join("user/files")),
     )));
+    let archive_files = Arc::new(ServerDataArchiveFiles::new(&data_root));
     let data_archive_service = Arc::new(DataArchiveService::new(
+        database_service.clone(),
         Arc::new(DataArchiveJobRegistry::new()),
         tokio::runtime::Handle::current(),
-        Arc::new(tt_adapter_archive::FileDataArchiveExecutor),
-        Arc::new(ServerDataArchiveFiles::new(&data_root)),
+        Arc::new(tt_adapter_archive::FileDataArchiveExecutor {
+            prepare_personas: tt_adapter_media::persona_cards::migrate_personas,
+            read_personas: tt_adapter_media::persona_cards::read_personas,
+        }),
+        archive_files.clone(),
         Arc::new(DataDirectoryInitializer),
         Arc::new(ServiceCacheReconciler {
             character_service: character_service.clone(),
@@ -410,6 +479,7 @@ pub async fn build(
             secret_service: secret_service.clone(),
             settings_service: settings_service.clone(),
             chat_history_coordinator: chat_history_coordinator.clone(),
+            mcp_service: mcp_service.clone(),
         }),
     ));
     Ok(ServerServices {
@@ -423,7 +493,7 @@ pub async fn build(
         stable_diffusion_service,
         translate_service,
         tts_service,
-        chat_payload_commit_service,
+        chat_commit_service,
         settings_service,
         secret_service,
         skill_service,
@@ -445,16 +515,13 @@ pub async fn build(
         agent_runtime_service,
         chat_completion_service,
         llm_connection_service,
-        tokenization_service: Arc::new(TokenizationService::new(Arc::new(
-            MiktikTokenizerRepository::new(
-                data_root.join("_cache").join("tokenizers"),
-                http_client_pool,
-            ),
-        ))),
+        tokenization_service,
         world_info_service: Arc::new(WorldInfoService::new(world_info_repository)),
-        native_regex_service: Arc::new(NativeRegexService::new()),
         host_resource_service,
         user_file_service,
+        sprite_service, mcp_service, searxng_search_service, vector_service, database_service,
+        user_endpoint_access_service,
+        archive_files,
         data_archive_service,
         ios_policy,
     })

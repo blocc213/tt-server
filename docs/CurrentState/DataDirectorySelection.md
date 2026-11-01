@@ -19,7 +19,7 @@
 ### 2.1 前端设置面板
 
 - 位置：`src/scripts/tauri/setting/setting-panel/settings-popup.js`
-- 仅桌面端显示 `System -> Data Directory`（折叠区块）
+- 仅桌面宿主显示 `System -> Data Directory`（折叠区块），与后端只在 `cfg(desktop)` 下注册相关命令同源
 - 通过 `src/tauri-bridge.js` 的 `openDialog(...)` 调用 `plugin:dialog|open` 打开系统目录选择器（避免裸模块导入）
 - 选择后调用后端命令：
   - `get_runtime_paths`
@@ -41,7 +41,7 @@
 
 - `src-tauri/crates/tauritavern/src/lib.rs` 在 `setup` 早期调用 `resolve_runtime_paths(...)`
 - `RuntimePaths` 一旦确定，就被作为 managed state 注入并用于：
-  - asset protocol scope
+  - asset protocol 与 plugin-fs runtime scope
   - Host Resource Service 的用户资源与第三方扩展目录
   - 数据归档目录
   - 后端初始化

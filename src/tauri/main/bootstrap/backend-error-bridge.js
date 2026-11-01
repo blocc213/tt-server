@@ -1,5 +1,7 @@
 // @ts-check
 
+import { invoke, listen } from '../../../tauri-bridge.js';
+
 const TAURI_BACKEND_ERROR_EVENT = 'tauritavern-backend-error';
 const FRONTEND_BACKEND_ERROR_EVENT = 'tauritavern:backend-error';
 const BACKEND_ERROR_QUEUE_KEY = '__TAURITAVERN_BACKEND_ERROR_QUEUE__';
@@ -42,22 +44,10 @@ function publishBackendError(payload) {
 }
 
 export async function installBackendErrorBridge() {
-    // The app mirrors error-level backend logs into a webview event stream.
-    // The server reports failures in each HTTP response instead, so there is no
-    // event stream to attach to and nothing queued to drain.
-    const tauriEvent = window.__TAURI__?.event;
-    if (typeof tauriEvent?.listen !== 'function') {
-        return;
-    }
-
-    await tauriEvent.listen(TAURI_BACKEND_ERROR_EVENT, (event) => {
+    if (typeof window.__TAURI__?.event?.listen !== 'function') return;
+    await listen(TAURI_BACKEND_ERROR_EVENT, (event) => {
         publishBackendError(event?.payload);
     });
-
-    const invoke = window.__TAURI__?.core?.invoke;
-    if (typeof invoke !== 'function') {
-        throw new Error('Tauri invoke is unavailable for backend error bridge');
-    }
 
     const pendingErrors = await invoke('backend_error_bridge_ready');
     if (Array.isArray(pendingErrors)) {

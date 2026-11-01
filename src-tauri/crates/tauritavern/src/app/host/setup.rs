@@ -7,9 +7,11 @@
 use std::sync::Arc;
 
 use crate::app::{BackendReadiness, StartupProfile, spawn_initialization};
+use crate::infrastructure::agent_extension_tools::AgentExtensionTools;
 use crate::infrastructure::logging::llm_api_logs::LlmApiLogStore;
 use tauri::Manager;
 use tt_adapter_http::HttpClientPool;
+use tt_adapter_storage_core::commit_stage::PageGeneration;
 use tt_domain::errors::DomainError;
 use tt_domain::ios_policy::IosPolicyScope;
 
@@ -23,11 +25,13 @@ pub(super) fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Erro
 
     // 2. Publish lightweight host services that do not depend on user settings.
     // AppState construction later reuses the same HTTP pool via managed state.
+    app.manage(Arc::new(AgentExtensionTools::default()));
+    app.manage(Arc::new(PageGeneration::default()));
     let http_client_pool = Arc::new(HttpClientPool::new(crate::product::USER_AGENT));
     app.manage(http_client_pool.clone());
     super::resources::install_bundled_templates(app, &app_handle);
 
-    #[cfg(any(target_os = "macos", windows, target_os = "linux"))]
+    #[cfg(desktop)]
     // Desktop window-state needs the resolved data root and must be installed
     // before the main window exists. The main window restores state manually.
     super::window::install_window_state_plugin(&app_handle, &runtime_paths.data_root)?;
@@ -35,7 +39,7 @@ pub(super) fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Erro
     // 3. Bring up observability before emitting user-visible startup diagnostics.
     let observability = super::observability::install(app, &app_handle, &runtime_paths)?;
 
-    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    #[cfg(desktop)]
     super::observability::emit_pending_runtime_migration_error(&runtime_paths);
 
     tracing::debug!("Starting TauriTavern application");
@@ -47,7 +51,7 @@ pub(super) fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Erro
         &startup_profile,
         &http_client_pool,
         &observability.llm_api_logs,
-    )?;
+    );
 
     let backend_readiness = Arc::new(BackendReadiness::new());
     if !app.manage(backend_readiness.clone()) {
@@ -66,7 +70,7 @@ pub(super) fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Erro
     )?;
     let _main_window = super::window::create_main_window(app, host_resource_service)?;
 
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[cfg(all(desktop, not(windows)))]
     super::shutdown::install_window_close_handler(&_main_window);
 
     #[cfg(target_os = "windows")]
@@ -93,25 +97,27 @@ fn apply_startup_profile(
     startup_profile: &StartupProfile,
     http_client_pool: &HttpClientPool,
     llm_api_log_store: &LlmApiLogStore,
-) -> Result<(), Box<dyn std::error::Error>> {
+) {
     let tauritavern_settings = &startup_profile.tauritavern_settings;
     let ios_policy = &startup_profile.ios_policy;
 
-    // Fail fast when startup settings request a host capability that the active
-    // iOS policy forbids. Do not silently disable proxy settings: users should
-    // see an explicit startup failure for an invalid distribution profile.
     if ios_policy.scope == IosPolicyScope::Ios
         && tauritavern_settings.request_proxy.enabled
         && !ios_policy.capabilities.network.request_proxy
     {
-        return Err(Box::new(DomainError::InvalidData(
-            "iOS policy disabled capability: network.request_proxy".to_string(),
-        )));
+        http_client_pool.block_requests_for_invalid_proxy();
+        tracing::error!(
+            "iOS policy disables the configured request proxy; outbound HTTP is blocked until the proxy is disabled in TauriTavern Settings"
+        );
+    } else if let Err(error) =
+        http_client_pool.apply_persisted_request_proxy_settings(&tauritavern_settings.request_proxy)
+    {
+        tracing::error!(
+            error = %error,
+            "Request proxy settings are invalid; outbound HTTP is blocked until corrected"
+        );
     }
 
-    // Apply startup-only runtime effects from the same settings snapshot that is
-    // passed into AppState, avoiding the old double-read drift.
-    http_client_pool.apply_request_proxy_settings(&tauritavern_settings.request_proxy)?;
+    // Apply the remaining startup-only effect from the same settings snapshot.
     llm_api_log_store.apply_settings(tauritavern_settings.dev.effective_llm_api_keep());
-    Ok(())
 }

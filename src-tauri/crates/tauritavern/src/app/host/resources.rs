@@ -35,8 +35,8 @@ pub(super) fn install_runtime_resources(
     runtime_paths: &RuntimePaths,
     startup_profile: &StartupProfile,
 ) -> Result<Arc<HostResourceService>, DomainError> {
-    // tauri.conf.json whitelists standard Tauri directories; this dynamic scope
-    // adds the resolved data root, including portable/migrated roots.
+    // Static scopes cannot cover portable or migrated data roots. Publish the
+    // resolved root to both browser assets and FileHandle transports.
     if let Err(error) = app_handle
         .asset_protocol_scope()
         .allow_directory(&runtime_paths.data_root, true)
@@ -48,18 +48,13 @@ pub(super) fn install_runtime_resources(
         );
     }
 
-    let chat_staging_root = runtime_paths
-        .data_root
-        .join("default-user")
-        .join(".staging")
-        .join("chat-commits");
     app_handle
         .fs_scope()
-        .allow_directory(&chat_staging_root, true)
+        .allow_directory(&runtime_paths.data_root, true)
         .map_err(|error| {
             DomainError::InternalError(format!(
-                "Failed to extend filesystem scope for chat staging {}: {error}",
-                chat_staging_root.display()
+                "Failed to extend filesystem scope for data root {}: {error}",
+                runtime_paths.data_root.display()
             ))
         })?;
 
@@ -73,9 +68,13 @@ pub(super) fn install_runtime_resources(
         startup_profile
             .tauritavern_settings
             .avatar_persona_original_images_enabled,
-        host_resource_store,
+        host_resource_store.clone(),
     ));
     app.manage(host_resource_service.clone());
+    #[cfg(mobile)]
+    app.manage(Arc::new(
+        tt_adapter_media::window_backdrop::WindowBackdropRenderer::new(host_resource_store),
+    ));
 
     // User media is a separate command-facing service, but it shares the same
     // runtime data root and should be published with the rest of resource state.

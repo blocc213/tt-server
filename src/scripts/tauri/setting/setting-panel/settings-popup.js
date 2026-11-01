@@ -12,7 +12,10 @@ import {
 } from './settings-view-model.js';
 import { buildTauriTavernSettingsUpdate } from './settings-patch.js';
 import { applyTauriTavernSettingsUpdateEffects } from './settings-effects.js';
-import { callTauriTavernPanelPopup } from '../panel-popup.js';
+import { callTauriTavernPanelPopup, createTauriTavernPanelPopup } from '../panel-popup.js';
+import { setOledBackgroundEnabled } from '../oled-background.js';
+import { isBackgroundGenerationAvailable, isBackgroundGenerationEnabled, setBackgroundGenerationEnabled } from '../../../tauritavern/background-generation.js';
+import { saveSettings } from '../../../../script.js';
 
 const SETTINGS_STYLE_ID = 'tauritavern-settings-style';
 
@@ -41,12 +44,40 @@ const HELP_TOPICS = {
             'When enabled, only messages near the viewport and the newest message stay mounted. Turn it off to use upstream SillyTavern chat rendering. Renderer extensions must support ChatSurface.',
         ],
     },
+    coldSwipes: {
+        title: 'Load historical swipes on demand',
+        lines: [
+            'Reduces memory use by loading alternate swipes of older messages only when needed. Opening a chat loads current text and all swipes of the last message.',
+            'Only affects display, not saving or exporting. Requires reload to apply.',
+        ],
+    },
+    codeMirrorEditor: {
+        title: 'CodeMirror Editor',
+        lines: [
+            'When enabled, supported textareas in Preset, World Info, Regex, and Quick Reply editors use CodeMirror. The editor bundle is loaded only when needed.',
+            "Text is synchronized at each feature's existing save or update boundary, reducing full-text copies while typing.",
+            'Some textarea-specific features, including macro autocomplete and Markdown shortcuts, are not available in CodeMirror.',
+            'Requires reload to apply.',
+        ],
+    },
+    automaticChatBackups: {
+        title: 'Automatic Chat Backups',
+        lines: [
+            'Create a backup automatically when an eligible chat save completes.',
+        ],
+    },
     zstdCompression: {
         title: 'zstd Compression',
         lines: [
             'zstd compression applies to all chat backups.',
             'When this setting changes, existing backups are converted in the background.',
             'TauriTavern can read zstd backups directly. SillyTavern does not support this backup format.',
+        ],
+    },
+    backupsPerCharacterOrGroup: {
+        title: 'Backups per character or group',
+        lines: [
+            'Maximum backups sharing the same character or group name.',
         ],
     },
     closeToTray: {
@@ -77,6 +108,12 @@ const HELP_TOPICS = {
             'Character/User avatar originals help: off',
         ],
     },
+    oledBackground: {
+        title: 'OLED Pure Black Background',
+        lines: [
+            'Use pure black backgrounds and hide wallpaper on this device, keeping theme text and accent colors.',
+        ],
+    },
     dynamicTheme: {
         title: 'Dynamic Theme & Wallpaper',
         lines: [
@@ -99,7 +136,7 @@ function ensureSettingsStyle() {
 }
 
 async function importSettingsBundle() {
-    return import(new URL('../dist/settings.bundle.js', import.meta.url).href);
+    return import('/scripts/tauri/setting/dist/settings.bundle.js' /* webpackIgnore: true */);
 }
 
 function readThemeOptions() {
@@ -349,9 +386,14 @@ async function chooseDataRoot() {
 
 function createSettingsActions(backgroundOptions) {
     return {
+        backgroundGeneration: isBackgroundGenerationAvailable() ? { enabled: isBackgroundGenerationEnabled(), setEnabled: setBackgroundGenerationEnabled } : undefined,
         chooseDataRoot: () => runTaskOrPopup(chooseDataRoot),
         chooseWallpaper: (request) => runTaskOrPopup(() => chooseWallpaper(backgroundOptions, request)),
         showHelp: (topicId) => runTaskOrPopup(() => showHelpTopic(topicId)),
+        manageQuickAccess: () => runTaskOrPopup(async () => {
+            const { openExtensionMenuShortcutsManager } = await import('../extension-menu-shortcuts.js');
+            await openExtensionMenuShortcutsManager();
+        }),
         reloadFrontend: () => runTaskOrPopup(async () => {
             window.location.reload();
         }),
@@ -392,10 +434,11 @@ export async function openTauriTavernSettingsPopup() {
         actions: createSettingsActions(backgroundModel.backgroundOptions),
         tr: translate,
     });
-    let pendingUpdate = null;
+    let savedUpdate = null;
 
     try {
-        const popupPromise = callTauriTavernPanelPopup(mount, POPUP_TYPE.CONFIRM, '', {
+        const popup = createTauriTavernPanelPopup(mount, POPUP_TYPE.CONFIRM, '', {
+            label: translate('TauriTavern Settings'),
             okButton: translate('Save'),
             cancelButton: translate('Close'),
             allowVerticalScrolling: true,
@@ -408,29 +451,49 @@ export async function openTauriTavernSettingsPopup() {
                 }
 
                 try {
-                    pendingUpdate = buildTauriTavernSettingsUpdate(viewModel.values, appHandle.getDraft());
+                    const draft = appHandle.getDraft();
+                    const update = buildTauriTavernSettingsUpdate(viewModel.values, draft);
+
+                    if (
+                        update.requiresChatBackupPurgeConfirmation
+                        && !await confirmChatBackupHistoryPurge()
+                    ) {
+                        return false;
+                    }
+
+                    if (
+                        update.changes.chatVirtualizationEnabled
+                        && update.next.chatVirtualizationEnabled
+                    ) {
+                        await showChatVirtualizationCompatibility();
+                    }
+
+                    // Account preferences use the sectioned ST commit, not the native TT patch.
+                    // A Save click must acknowledge that commit before the page can be reloaded.
+                    if (isBackgroundGenerationAvailable() && !await saveSettings()) {
+                        throw new Error('Background generation preference was not saved. Keep this page and try again.');
+                    }
+                    if (update.hasChanges) {
+                        const updatedSettings = await updateTauriTavernSettings(update.patch);
+                        savedUpdate = { update, updatedSettings };
+                    }
+
+                    if (draft.oledBackgroundEnabled !== viewModel.values.oledBackgroundEnabled) {
+                        try {
+                            setOledBackgroundEnabled(draft.oledBackgroundEnabled);
+                        } catch (error) {
+                            console.warn('Could not save OLED background setting:', error);
+                            toastr.warning(translate('Could not save OLED background setting.'));
+                        }
+                    }
+                    return true;
                 } catch (error) {
                     await showErrorPopup(error);
                     return false;
                 }
-
-                if (
-                    pendingUpdate.requiresChatBackupPurgeConfirmation
-                    && !await confirmChatBackupHistoryPurge()
-                ) {
-                    return false;
-                }
-
-                if (
-                    pendingUpdate.changes.chatVirtualizationEnabled
-                    && pendingUpdate.next.chatVirtualizationEnabled
-                ) {
-                    await showChatVirtualizationCompatibility();
-                }
-
-                return true;
             },
         });
+        const popupPromise = popup.show();
         if (viewModel.values.chatBackups.zstdCompressionEnabled) {
             void loadChatBackupStorageStats()
                 .then(appHandle.setChatBackupStorageStats)
@@ -439,18 +502,11 @@ export async function openTauriTavernSettingsPopup() {
 
         const result = await popupPromise;
 
-        if (result !== POPUP_RESULT.AFFIRMATIVE) {
+        if (result !== POPUP_RESULT.AFFIRMATIVE || !savedUpdate) {
             return;
         }
 
-        const update = pendingUpdate
-            ?? buildTauriTavernSettingsUpdate(viewModel.values, appHandle.getDraft());
-        if (!update.hasChanges) {
-            return;
-        }
-
-        const updatedSettings = await updateTauriTavernSettings(update.patch);
-        applyTauriTavernSettingsUpdateEffects(update, updatedSettings);
+        applyTauriTavernSettingsUpdateEffects(savedUpdate.update, savedUpdate.updatedSettings);
     } finally {
         appHandle.unmount();
     }

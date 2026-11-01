@@ -128,3 +128,30 @@ fn map_read_error(relative_path: &str, path: &Path, error: std::io::Error) -> Do
         ))
     }
 }
+
+/// Logical native bundle names mapped to the browser's actual frontend tree.
+pub struct FrontendTemplateStore(pub PathBuf);
+
+impl tt_ports::bundled_template::BundledTemplateStore for FrontendTemplateStore {
+    fn read_text(&self, relative_path: &str) -> Result<String, DomainError> {
+        let relative = if let Some(name) = relative_path.strip_prefix("frontend-templates/") {
+            PathBuf::from("scripts/templates").join(name)
+        } else if let Some(name) = relative_path.strip_prefix("frontend-extensions/") {
+            PathBuf::from("scripts/extensions").join(name)
+        } else {
+            return Err(DomainError::InvalidData("Invalid frontend template resource".into()));
+        };
+        if relative.components().any(|part| !matches!(part, std::path::Component::Normal(_))) {
+            return Err(DomainError::InvalidData("Invalid frontend template path".into()));
+        }
+        let root = std::fs::canonicalize(&self.0)
+            .map_err(|error| map_read_error(relative_path, &self.0, error))?;
+        let requested = root.join(relative);
+        let path = std::fs::canonicalize(&requested)
+            .map_err(|error| map_read_error(relative_path, &requested, error))?;
+        if !path.starts_with(&root) {
+            return Err(DomainError::InvalidData("Frontend template escapes frontend directory".into()));
+        }
+        std::fs::read_to_string(&path).map_err(|error| map_read_error(relative_path, &path, error))
+    }
+}

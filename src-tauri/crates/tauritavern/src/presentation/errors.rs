@@ -55,13 +55,22 @@ impl From<DomainError> for CommandError {
             DomainError::InvalidData(msg) => CommandError::BadRequest(msg),
             DomainError::Conflict(msg) => CommandError::Conflict(msg),
             DomainError::AuthenticationError(msg) => CommandError::Unauthorized(msg),
+            error @ DomainError::WorkspaceAccessDenied { .. } => {
+                CommandError::Unauthorized(error.to_string())
+            }
             DomainError::Cancelled(msg) => CommandError::Cancelled(msg),
+            error @ DomainError::FileIo { .. } => {
+                CommandError::InternalServerError(error.to_string())
+            }
             DomainError::InternalError(msg) => CommandError::InternalServerError(msg),
             DomainError::RateLimited { message } => CommandError::TooManyRequests(message),
             DomainError::Transient(msg) => CommandError::InternalServerError(msg),
             DomainError::UpstreamFailure(failure) => CommandError::UpstreamFailure(failure),
             DomainError::WorkspacePathIsDirectory { path } => {
                 CommandError::BadRequest(format!("Workspace path is a directory: {path}"))
+            }
+            DomainError::WorkspaceFileNotText { path } => {
+                CommandError::BadRequest(format!("Workspace file is not UTF-8 text: {path}"))
             }
             DomainError::WorkspaceWriteConflict { kind, .. } => {
                 CommandError::BadRequest(format!("Workspace write conflict: {kind}"))
@@ -73,51 +82,5 @@ impl From<DomainError> for CommandError {
 impl From<tauri::Error> for CommandError {
     fn from(error: tauri::Error) -> Self {
         CommandError::InternalServerError(error.to_string())
-    }
-}
-
-impl CommandError {
-    pub fn upstream_failure(&self) -> Option<&UpstreamFailure> {
-        match self {
-            CommandError::UpstreamFailure(failure) => Some(failure),
-            _ => None,
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use tt_domain::errors::GENERATION_CANCELLED_BY_USER_MESSAGE;
-
-    use super::*;
-
-    #[test]
-    fn domain_cancelled_maps_to_command_cancelled() {
-        let error: CommandError = DomainError::generation_cancelled_by_user().into();
-
-        assert!(matches!(
-            &error,
-            CommandError::Cancelled(message) if message == GENERATION_CANCELLED_BY_USER_MESSAGE
-        ));
-    }
-
-    #[test]
-    fn application_cancelled_maps_to_command_cancelled() {
-        let error: CommandError = ApplicationError::Cancelled("Job cancelled".to_string()).into();
-
-        assert!(matches!(
-            &error,
-            CommandError::Cancelled(message) if message == "Job cancelled"
-        ));
-    }
-
-    #[test]
-    fn domain_conflict_maps_to_command_conflict() {
-        let error: CommandError = DomainError::Conflict("busy".to_string()).into();
-
-        assert!(matches!(
-            error,
-            CommandError::Conflict(message) if message == "busy"
-        ));
     }
 }

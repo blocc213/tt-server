@@ -1,38 +1,33 @@
 mod card_contract;
+mod lorebook_adoption;
 mod lorebook_codec;
 
 use crate::dto::character_dto::{
     BulkMergeCharacterCardDataDto, BulkMergeCharacterCardDataResultDto, CharacterChatDto,
-    CharacterDto, CharacterLorebookConflictDto, CharacterLorebookConflictResolution,
-    CheckCharacterLorebookConflictDto, CreateCharacterDto, CreateCharacterWithAvatarResultDto,
-    CreateWithAvatarDto, DeleteCharacterDto, DuplicateCharacterDto, ExportCharacterContentDto,
-    ExportCharacterContentResultDto, ExportCharacterDto, GetCharacterChatsDto, ImportCharacterDto,
-    MergeCharacterCardDataDto, RenameCharacterDto, ReplaceCharacterDto,
-    ResolveCharacterLorebookConflictDto, ResolveCharacterLorebookConflictResultDto,
-    UpdateAvatarDto, UpdateCharacterCardDataDto, UpdateCharacterDto, merge_character_extensions,
+    CharacterDto, CharacterLorebookAdoptionDto, CreateCharacterDto,
+    CreateCharacterWithAvatarResultDto, CreateWithAvatarDto, DeleteCharacterDto,
+    DuplicateCharacterDto, ExportCharacterContentDto, ExportCharacterContentResultDto,
+    GetCharacterChatsDto, ImportCharacterDto, ImportCharacterResultDto, MergeCharacterCardDataDto,
+    RenameCharacterDto, ReplaceCharacterDto, UpdateAvatarDto, UpdateCharacterCardDataDto,
+    UpdateCharacterDto,
 };
 use crate::errors::ApplicationError;
 use crate::services::agent_workspace_lifecycle_service::{
     AgentChatWorkspaceTarget, AgentWorkspaceLifecycleService,
 };
 use crate::services::chat_history_coordinator::ChatHistoryCoordinator;
-use crate::services::hashing::hex_lower;
 use serde_json::Value;
-use sha2::{Digest, Sha256};
-use std::collections::HashSet;
 use std::path::Path;
 use std::sync::Arc;
 use tt_contracts::client_asset_paths::validate_path_segment;
 use tt_domain::errors::DomainError;
 use tt_domain::json_merge::{merge_json_value, merge_json_value_with_unset};
 use tt_domain::models::character::Character;
-use tt_domain::models::filename::MAX_SANITIZED_FILENAME_BYTES;
-use tt_domain::models::world_info::{WORLD_INFO_EXTENSION, sanitize_world_info_name};
 use tt_ports::repositories::character_repository::{CharacterRepository, ImageCrop};
 use tt_ports::repositories::chat_repository::ChatRepository;
 use tt_ports::repositories::world_info_repository::WorldInfoRepository;
 
-use self::lorebook_codec::{character_book_to_world_info, world_info_to_character_book};
+use self::lorebook_codec::world_info_to_character_book;
 
 /// Service for character management
 pub struct CharacterService {
@@ -47,12 +42,6 @@ pub struct CharacterService {
 enum CharacterCardValidationMode {
     ReadableOnly,
     Strict,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum CharacterCardLorebookMaterializationMode {
-    MaterializePrimary,
-    Skip,
 }
 
 impl CharacterService {
@@ -87,8 +76,7 @@ impl CharacterService {
     pub async fn get_character(&self, name: &str) -> Result<CharacterDto, ApplicationError> {
         tracing::debug!("Getting character: {}", name);
         let character = self.repository.find_by_name(name).await?;
-        let raw_json = character.json_data.clone();
-        Ok(CharacterDto::from(character).with_json_data(raw_json))
+        Ok(CharacterDto::from(character))
     }
 
     /// Create a new character
@@ -105,7 +93,7 @@ impl CharacterService {
         // Validate character
         self.validate_character(&character)?;
         self.materialize_create_lorebook(&mut character, primary_lorebook.as_deref())
-            .await?;
+            .await;
 
         let created = self
             .repository
@@ -130,7 +118,7 @@ impl CharacterService {
         // Validate character
         self.validate_character(&character)?;
         self.materialize_create_lorebook(&mut character, primary_lorebook.as_deref())
-            .await?;
+            .await;
 
         // Convert avatar path
         let avatar_path_ref: Option<&Path> = dto.avatar_path.as_deref().map(Path::new);
@@ -154,16 +142,10 @@ impl CharacterService {
         dto: UpdateCharacterDto,
     ) -> Result<CharacterDto, ApplicationError> {
         tracing::debug!("Updating character: {}", name);
-
-        // Get the existing character
-        let mut character = self.repository.find_by_name(name).await?;
-        let raw_json = match character.json_data.clone() {
-            Some(value) => value,
-            None => self.repository.read_character_card_json(name).await?,
-        };
+        let raw_json = self.repository.read_character_card_json(name).await?;
         let mut card_value = card_contract::parse_character_card_json(&raw_json)?;
         let UpdateCharacterDto {
-            name: new_name,
+            name: character_name,
             chat,
             description,
             personality,
@@ -182,111 +164,71 @@ impl CharacterService {
             extensions,
         } = dto;
 
-        // Apply updates
-        if let Some(new_name) = new_name {
-            character.name = new_name;
-            character.data.name = character.name.clone();
+        let mut root_update = serde_json::Map::new();
+        let mut data_update = serde_json::Map::new();
+        let mut extension_update = match extensions {
+            Some(Value::Object(extensions)) => extensions,
+            Some(_) => {
+                return Err(ApplicationError::ValidationError(
+                    "Invalid character extensions: expected a JSON object".to_string(),
+                ));
+            }
+            None => serde_json::Map::new(),
+        };
+
+        for (field, value) in [
+            ("name", character_name.map(Value::String)),
+            ("description", description.map(Value::String)),
+            ("personality", personality.map(Value::String)),
+            ("scenario", scenario.map(Value::String)),
+            ("first_mes", first_mes.map(Value::String)),
+            ("mes_example", mes_example.map(Value::String)),
+            ("creator", creator.map(Value::String)),
+            ("creator_notes", creator_notes.map(Value::String)),
+            ("character_version", character_version.map(Value::String)),
+            ("tags", tags.map(|tags| serde_json::json!(tags))),
+        ] {
+            if let Some(value) = value {
+                root_update.insert(field.to_string(), value.clone());
+                data_update.insert(field.to_string(), value);
+            }
         }
 
         if let Some(chat) = chat {
-            character.chat = chat;
+            root_update.insert("chat".to_string(), Value::String(chat));
         }
-
-        if let Some(description) = description {
-            character.description = description;
-            character.data.description = character.description.clone();
-        }
-
-        if let Some(personality) = personality {
-            character.personality = personality;
-            character.data.personality = character.personality.clone();
-        }
-
-        if let Some(scenario) = scenario {
-            character.scenario = scenario;
-            character.data.scenario = character.scenario.clone();
-        }
-
-        if let Some(first_mes) = first_mes {
-            character.first_mes = first_mes;
-            character.data.first_mes = character.first_mes.clone();
-        }
-
-        if let Some(mes_example) = mes_example {
-            character.mes_example = mes_example;
-            character.data.mes_example = character.mes_example.clone();
-        }
-
-        if let Some(creator) = creator {
-            character.creator = creator;
-            character.data.creator = character.creator.clone();
-        }
-
-        if let Some(creator_notes) = creator_notes {
-            character.creator_notes = creator_notes;
-            character.data.creator_notes = character.creator_notes.clone();
-        }
-
-        if let Some(character_version) = character_version {
-            character.character_version = character_version;
-            character.data.character_version = character.character_version.clone();
-        }
-
-        if let Some(tags) = tags {
-            character.tags = tags;
-            character.data.tags = character.tags.clone();
-        }
-
-        if let Some(talkativeness) = talkativeness {
-            character.talkativeness = talkativeness;
-            character.data.extensions.talkativeness = character.talkativeness;
-        }
-
-        if let Some(fav) = fav {
-            character.fav = fav;
-            character.data.extensions.fav = character.fav;
-        }
-
         if let Some(alternate_greetings) = alternate_greetings {
-            character.data.alternate_greetings = alternate_greetings;
+            data_update.insert(
+                "alternate_greetings".to_string(),
+                serde_json::json!(alternate_greetings),
+            );
         }
-
         if let Some(system_prompt) = system_prompt {
-            character.data.system_prompt = system_prompt;
+            data_update.insert("system_prompt".to_string(), Value::String(system_prompt));
         }
-
         if let Some(post_history_instructions) = post_history_instructions {
-            character.data.post_history_instructions = post_history_instructions;
+            data_update.insert(
+                "post_history_instructions".to_string(),
+                Value::String(post_history_instructions),
+            );
         }
-
-        if let Some(extensions) = extensions {
-            merge_character_extensions(&mut character, extensions)
-                .map_err(Self::map_extensions_error)?;
+        if let Some(talkativeness) = talkativeness {
+            let value = serde_json::json!(talkativeness);
+            root_update.insert("talkativeness".to_string(), value.clone());
+            extension_update.insert("talkativeness".to_string(), value);
         }
-
-        if talkativeness.is_some() {
-            character.data.extensions.talkativeness = character.talkativeness;
-        } else {
-            character.talkativeness = character.data.extensions.talkativeness;
+        if let Some(fav) = fav {
+            let value = Value::Bool(fav);
+            root_update.insert("fav".to_string(), value.clone());
+            extension_update.insert("fav".to_string(), value);
         }
-
-        if fav.is_some() {
-            character.data.extensions.fav = character.fav;
-        } else {
-            character.fav = character.data.extensions.fav;
+        if !extension_update.is_empty() {
+            data_update.insert("extensions".to_string(), Value::Object(extension_update));
         }
-
-        let mut updated_value = serde_json::to_value(character.to_v2()).map_err(|error| {
-            ApplicationError::InternalError(format!(
-                "Failed to serialize updated character payload: {}",
-                error
-            ))
-        })?;
-        if let Some(updated_object) = updated_value.as_object_mut() {
-            updated_object.remove("spec");
-            updated_object.remove("spec_version");
+        if !data_update.is_empty() {
+            root_update.insert("data".to_string(), Value::Object(data_update));
         }
-        merge_json_value(&mut card_value, updated_value);
+        merge_json_value(&mut card_value, Value::Object(root_update));
 
         let updated = self
             .write_character_card_value(
@@ -295,7 +237,6 @@ impl CharacterService {
                 None,
                 None,
                 CharacterCardValidationMode::ReadableOnly,
-                CharacterCardLorebookMaterializationMode::MaterializePrimary,
             )
             .await?;
 
@@ -310,84 +251,38 @@ impl CharacterService {
     ) -> Result<CharacterDto, ApplicationError> {
         tracing::debug!("Updating character card data: {}", name);
 
-        let crop = dto.crop.map(ImageCrop::from);
-        let avatar_path = dto.avatar_path.as_deref().map(Path::new);
+        let UpdateCharacterCardDataDto {
+            card_json,
+            avatar_path,
+            crop,
+            materialize_primary_lorebook,
+        } = dto;
+        let crop = crop.map(ImageCrop::from);
+        let avatar_path = avatar_path.as_deref().map(Path::new);
+        let mut card_value = card_contract::parse_character_card_json(&card_json)?;
+        if materialize_primary_lorebook
+            && let Err(error) = self
+                .materialize_primary_lorebook_value(&mut card_value)
+                .await
+        {
+            tracing::error!(
+                target: tt_contracts::observability::USER_VISIBLE_ERROR,
+                "Saving character '{}' without refreshing its linked lorebook: {}",
+                name,
+                error
+            );
+        }
         let updated = self
             .write_character_card_value(
                 name,
-                card_contract::parse_character_card_json(&dto.card_json)?,
+                card_value,
                 avatar_path,
                 crop,
                 CharacterCardValidationMode::ReadableOnly,
-                CharacterCardLorebookMaterializationMode::MaterializePrimary,
             )
             .await?;
 
         Ok(CharacterDto::from(updated))
-    }
-
-    pub async fn check_lorebook_conflict(
-        &self,
-        dto: CheckCharacterLorebookConflictDto,
-    ) -> Result<CharacterLorebookConflictDto, ApplicationError> {
-        tracing::debug!("Checking character lorebook conflict: {}", dto.name);
-
-        let character = self.repository.find_by_name(&dto.name).await?;
-        self.character_lorebook_conflict(&character).await
-    }
-
-    pub async fn resolve_lorebook_conflict(
-        &self,
-        dto: ResolveCharacterLorebookConflictDto,
-    ) -> Result<ResolveCharacterLorebookConflictResultDto, ApplicationError> {
-        tracing::debug!(
-            "Resolving character lorebook conflict: {} ({:?})",
-            dto.name,
-            dto.resolution
-        );
-
-        let conflict = self
-            .character_lorebook_conflict(&self.repository.find_by_name(&dto.name).await?)
-            .await?;
-        if !conflict.conflict {
-            return Err(ApplicationError::ValidationError(
-                "Character has no lorebook conflict".to_string(),
-            ));
-        }
-        if dto.resolution == CharacterLorebookConflictResolution::Copy
-            && dto.conflict_token.is_none()
-        {
-            return Err(ApplicationError::ValidationError(
-                "Lorebook copy resolution requires a conflict token".to_string(),
-            ));
-        }
-        if let Some(token) = dto.conflict_token.as_deref()
-            && conflict.conflict_token.as_deref() != Some(token)
-        {
-            return Err(ApplicationError::Conflict(
-                "Character lorebook changed while awaiting resolution".to_string(),
-            ));
-        }
-
-        match dto.resolution {
-            CharacterLorebookConflictResolution::Current => {
-                let linked_world = self
-                    .resolve_lorebook_conflict_with_current_world(&dto.name)
-                    .await?;
-                Ok(ResolveCharacterLorebookConflictResultDto {
-                    world: linked_world,
-                    affected_world: None,
-                    world_written: false,
-                })
-            }
-            CharacterLorebookConflictResolution::Embedded => {
-                self.resolve_lorebook_conflict_with_embedded_book(&dto.name)
-                    .await
-            }
-            CharacterLorebookConflictResolution::Copy => {
-                self.resolve_lorebook_conflict_with_copy(&dto.name).await
-            }
-        }
     }
 
     /// Merge raw attributes into a stored character card using upstream-compatible deep merge semantics.
@@ -408,7 +303,6 @@ impl CharacterService {
                 None,
                 None,
                 CharacterCardValidationMode::Strict,
-                CharacterCardLorebookMaterializationMode::Skip,
             )
             .await?;
 
@@ -466,6 +360,10 @@ impl CharacterService {
     /// Delete a character
     pub async fn delete_character(&self, dto: DeleteCharacterDto) -> Result<(), ApplicationError> {
         tracing::debug!("Deleting character: {}", dto.name);
+        let _run_guard = self
+            .agent_workspace_lifecycle_service
+            .lock_run_lifecycle()
+            .await;
         let workspace_targets = if dto.delete_chats {
             self.agent_workspace_targets_for_character_chats(&dto.name)
                 .await?
@@ -488,9 +386,18 @@ impl CharacterService {
             .invalidate_character(&dto.name)
             .await;
         drop(execution_guard);
-        self.agent_workspace_lifecycle_service
-            .delete_chat_workspaces(&workspace_targets)
-            .await?;
+        if let Err(error) = self
+            .agent_workspace_lifecycle_service
+            .delete_chat_workspaces_locked(&workspace_targets)
+            .await
+        {
+            tracing::error!(
+                target: tt_contracts::observability::USER_VISIBLE_ERROR,
+                "Deleted character '{}' but could not delete all Agent workspaces: {}",
+                dto.name,
+                error
+            );
+        }
         Ok(())
     }
 
@@ -498,21 +405,18 @@ impl CharacterService {
         &self,
         character_name: &str,
     ) -> Result<Vec<AgentChatWorkspaceTarget>, ApplicationError> {
-        let summaries = self
+        let identities = self
             .chat_repository
-            .list_chat_summaries(Some(character_name), true)
+            .list_character_chat_identities(character_name)
             .await?;
         let mut targets = Vec::new();
-        for summary in summaries {
-            let Some(metadata) = summary.chat_metadata.as_ref() else {
-                continue;
-            };
-            if let Some(target) = AgentWorkspaceLifecycleService::character_target_from_metadata(
-                character_name,
-                &summary.file_name,
-                metadata,
-            )? {
-                targets.push(target);
+        for identity in identities {
+            if let Some(integrity) = identity.integrity {
+                targets.push(AgentWorkspaceLifecycleService::character_target(
+                    character_name,
+                    &identity.file_name,
+                    &integrity,
+                )?);
             }
         }
         Ok(targets)
@@ -557,72 +461,83 @@ impl CharacterService {
         Ok(CharacterDto::from(character))
     }
 
-    /// Import a character
+    /// Import a character and adopt its embedded lorebook without replacing existing worlds.
     pub async fn import_character(
         &self,
         dto: ImportCharacterDto,
-    ) -> Result<CharacterDto, ApplicationError> {
+    ) -> Result<ImportCharacterResultDto, ApplicationError> {
         tracing::debug!("Importing character from: {}", dto.file_path);
-        let mut character = self
+        let character = self
             .repository
             .import_character(Path::new(&dto.file_path), dto.preserve_file_name)
             .await?;
-
-        if let Err(error) = self
-            .try_auto_import_embedded_world_info(&mut character)
-            .await
-        {
-            let rollback_name = character.get_file_name();
-            if let Err(rollback_error) = self.repository.delete(&rollback_name, false).await {
-                return Err(ApplicationError::InternalError(format!(
-                    "Failed to rollback imported character {} after embedded world info import error ({}): {}",
-                    rollback_name, error, rollback_error
-                )));
-            }
-
-            return Err(error.into());
-        }
-
-        Ok(CharacterDto::from(character))
+        Ok(self.finish_character_import(character, "").await)
     }
 
-    /// Replace a stored character while preserving its local primary lorebook binding.
+    /// Replace a stored character and adopt its embedded lorebook.
     pub async fn replace_character(
         &self,
         dto: ReplaceCharacterDto,
-    ) -> Result<CharacterDto, ApplicationError> {
+    ) -> Result<ImportCharacterResultDto, ApplicationError> {
         tracing::debug!("Replacing character {} from: {}", dto.name, dto.file_path);
         if !validate_path_segment(&dto.name) {
             return Err(ApplicationError::ValidationError(
                 "Character storage identity is invalid".to_string(),
             ));
         }
-        let current = self.repository.find_by_name(&dto.name).await?;
-        let primary_lorebook = (!current.data.extensions.world.is_empty())
-            .then_some(current.data.extensions.world.as_str());
+        let primary_lorebook = match self
+            .repository
+            .read_character_card_json(&dto.name)
+            .await
+            .map_err(ApplicationError::from)
+            .and_then(|raw| card_contract::parse_character_card_json(&raw))
+        {
+            Ok(card) => card
+                .pointer("/data/extensions/world")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string(),
+            Err(error) => {
+                tracing::error!(
+                    target: tt_contracts::observability::USER_VISIBLE_ERROR,
+                    "Replacing character '{}' without preserving its optional lorebook binding: {}",
+                    dto.name,
+                    error
+                );
+                String::new()
+            }
+        };
         let character = self
             .repository
-            .replace_character(Path::new(&dto.file_path), &dto.name, primary_lorebook)
+            .replace_character(Path::new(&dto.file_path), &dto.name, &primary_lorebook)
             .await?;
 
-        Ok(CharacterDto::from(character))
+        Ok(self
+            .finish_character_import(character, &primary_lorebook)
+            .await)
     }
 
-    /// Export a character
-    pub async fn export_character(&self, dto: ExportCharacterDto) -> Result<(), ApplicationError> {
-        tracing::debug!("Exporting character: {} to {}", dto.name, dto.target_path);
-        let export_value = self.build_export_card_value(&dto.name).await?;
-        let export_json = serde_json::to_string_pretty(&export_value).map_err(|error| {
-            ApplicationError::InternalError(format!(
-                "Failed to serialize exported character JSON: {}",
-                error
-            ))
-        })?;
-
-        self.repository
-            .export_character(&dto.name, Path::new(&dto.target_path), &export_json)
-            .await?;
-        Ok(())
+    async fn finish_character_import(
+        &self,
+        mut character: Character,
+        previous: &str,
+    ) -> ImportCharacterResultDto {
+        let lorebook = match self.adopt_embedded_lorebook(&mut character, previous).await {
+            Ok(lorebook) => lorebook,
+            Err(error) => {
+                tracing::error!(
+                    target: tt_contracts::observability::USER_VISIBLE_ERROR,
+                    "Character '{}' was imported, but its embedded lorebook could not be adopted: {}",
+                    character.name,
+                    error
+                );
+                CharacterLorebookAdoptionDto::Failed
+            }
+        };
+        ImportCharacterResultDto {
+            character: CharacterDto::from(character),
+            lorebook,
+        }
     }
 
     /// Export character as downloadable content (PNG/JSON)
@@ -650,7 +565,6 @@ impl CharacterService {
 
             return Ok(ExportCharacterContentResultDto {
                 data: pretty_json.into_bytes(),
-                mime_type: "application/json".to_string(),
             });
         }
 
@@ -666,22 +580,22 @@ impl CharacterService {
             .export_character_png_bytes(&dto.name, &card_json)
             .await?;
 
-        Ok(ExportCharacterContentResultDto {
-            data: png_bytes,
-            mime_type: "image/png".to_string(),
-        })
+        Ok(ExportCharacterContentResultDto { data: png_bytes })
     }
 
     /// Update a character's avatar
     pub async fn update_avatar(&self, dto: UpdateAvatarDto) -> Result<(), ApplicationError> {
         tracing::debug!("Updating avatar for character: {}", dto.name);
-        let mut character = self.repository.find_by_name(&dto.name).await?;
-        self.materialize_primary_lorebook(&mut character).await?;
-
+        let raw_json = self.repository.read_character_card_json(&dto.name).await?;
         let crop = dto.crop.map(ImageCrop::from);
-        self.repository
-            .update_avatar(&character, Path::new(&dto.avatar_path), crop)
-            .await?;
+        self.write_character_card_value(
+            &dto.name,
+            card_contract::parse_character_card_json(&raw_json)?,
+            Some(Path::new(&dto.avatar_path)),
+            crop,
+            CharacterCardValidationMode::ReadableOnly,
+        )
+        .await?;
         Ok(())
     }
 
@@ -797,7 +711,6 @@ impl CharacterService {
             None,
             None,
             CharacterCardValidationMode::ReadableOnly,
-            CharacterCardLorebookMaterializationMode::Skip,
         )
         .await?;
 
@@ -815,11 +728,9 @@ impl CharacterService {
         avatar_path: Option<&Path>,
         crop: Option<ImageCrop>,
         validation_mode: CharacterCardValidationMode,
-        lorebook_mode: CharacterCardLorebookMaterializationMode,
     ) -> Result<Character, ApplicationError> {
-        let card_json = self
-            .prepare_character_card_json_for_write(&mut card_value, validation_mode, lorebook_mode)
-            .await?;
+        let card_json =
+            self.prepare_character_card_json_for_write(&mut card_value, validation_mode)?;
 
         self.repository
             .write_character_card_json(name, &card_json, avatar_path, crop)
@@ -827,18 +738,12 @@ impl CharacterService {
             .map_err(Into::into)
     }
 
-    async fn prepare_character_card_json_for_write(
+    fn prepare_character_card_json_for_write(
         &self,
         card_value: &mut Value,
         validation_mode: CharacterCardValidationMode,
-        lorebook_mode: CharacterCardLorebookMaterializationMode,
     ) -> Result<String, ApplicationError> {
         card_contract::strip_character_card_json_data(card_value);
-        if lorebook_mode == CharacterCardLorebookMaterializationMode::MaterializePrimary {
-            self.materialize_primary_lorebook_value(card_value).await?;
-        }
-        card_contract::normalize_v2_creator_metadata_projection(card_value)?;
-        card_contract::normalize_v2_character_book_extensions(card_value)?;
         self.validate_character_card_for_write(card_value, validation_mode)?;
 
         serde_json::to_string(card_value).map_err(|error| {
@@ -857,13 +762,11 @@ impl CharacterService {
         match validation_mode {
             CharacterCardValidationMode::ReadableOnly => {
                 let name = card_contract::character_card_name(card_value)?;
-                self.validate_character_name(name)?;
-                card_contract::ensure_readable_character_card(card_value)
+                self.validate_character_name(name).map_err(Into::into)
             }
-            CharacterCardValidationMode::Strict => {
-                self.validate_character_card_value(card_value)?;
-                card_contract::ensure_readable_character_card(card_value)
-            }
+            CharacterCardValidationMode::Strict => self
+                .validate_character_card_value(card_value)
+                .map_err(Into::into),
         }
     }
 
@@ -873,507 +776,45 @@ impl CharacterService {
         self.validate_character_name(name)
     }
 
-    async fn character_lorebook_conflict(
-        &self,
-        character: &Character,
-    ) -> Result<CharacterLorebookConflictDto, ApplicationError> {
-        let world_name = character.data.extensions.world.clone();
-        let embedded_name = character
-            .data
-            .character_book
-            .as_ref()
-            .and_then(Self::character_book_display_name);
-
-        let Some(embedded_book) = character.data.character_book.as_ref() else {
-            return Ok(CharacterLorebookConflictDto {
-                conflict: false,
-                world: world_name,
-                embedded_name,
-                current_available: false,
-                conflict_token: None,
-            });
-        };
-
-        if world_name.is_empty() {
-            return Ok(CharacterLorebookConflictDto {
-                conflict: false,
-                conflict_token: None,
-                world: world_name,
-                embedded_name,
-                current_available: false,
-            });
-        }
-
-        let embedded_canonical = Self::canonical_character_book_for_compare(embedded_book)?;
-        let Some(world_info) = self
-            .world_info_repository
-            .get_world_info(&world_name, false)
-            .await?
-        else {
-            return Ok(CharacterLorebookConflictDto {
-                conflict: true,
-                conflict_token: Some(Self::lorebook_conflict_token(
-                    &world_name,
-                    &embedded_canonical,
-                    None,
-                )?),
-                world: world_name,
-                embedded_name,
-                current_available: false,
-            });
-        };
-
-        let current_canonical = Self::canonical_world_info_for_compare(&world_info)?;
-        let conflict = embedded_canonical != current_canonical;
-
-        Ok(CharacterLorebookConflictDto {
-            conflict,
-            conflict_token: conflict
-                .then(|| {
-                    Self::lorebook_conflict_token(
-                        &world_name,
-                        &embedded_canonical,
-                        Some(&current_canonical),
-                    )
-                })
-                .transpose()?,
-            world: world_name,
-            embedded_name,
-            current_available: true,
-        })
-    }
-
-    fn lorebook_conflict_token(
-        world_name: &str,
-        embedded: &Value,
-        current: Option<&Value>,
-    ) -> Result<String, ApplicationError> {
-        let mut hasher = Sha256::new();
-        hasher.update(world_name.as_bytes());
-        hasher.update([0]);
-        hasher.update(serde_json::to_vec(embedded).map_err(|error| {
-            ApplicationError::InternalError(format!(
-                "Failed to serialize embedded lorebook for conflict check: {}",
-                error
-            ))
-        })?);
-        hasher.update([0]);
-        if let Some(current) = current {
-            hasher.update(serde_json::to_vec(current).map_err(|error| {
-                ApplicationError::InternalError(format!(
-                    "Failed to serialize current lorebook for conflict check: {}",
-                    error
-                ))
-            })?);
-        }
-
-        Ok(hex_lower(&hasher.finalize()))
-    }
-
-    async fn resolve_lorebook_conflict_with_current_world(
-        &self,
-        name: &str,
-    ) -> Result<String, ApplicationError> {
-        let raw_json = self.repository.read_character_card_json(name).await?;
-        let mut card_value = card_contract::parse_character_card_json(&raw_json)?;
-        let world_name = card_value
-            .pointer("/data/extensions/world")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string();
-
-        if world_name.is_empty() {
-            return Err(ApplicationError::ValidationError(
-                "Character has no linked world info".to_string(),
-            ));
-        }
-
-        self.materialize_primary_lorebook_value(&mut card_value)
-            .await?;
-        self.write_character_card_value(
-            name,
-            card_value,
-            None,
-            None,
-            CharacterCardValidationMode::ReadableOnly,
-            CharacterCardLorebookMaterializationMode::Skip,
-        )
-        .await?;
-
-        Ok(world_name)
-    }
-
-    async fn resolve_lorebook_conflict_with_embedded_book(
-        &self,
-        name: &str,
-    ) -> Result<ResolveCharacterLorebookConflictResultDto, ApplicationError> {
-        let character = self.repository.find_by_name(name).await?;
-        let world_name = character.data.extensions.world.clone();
-        if world_name.is_empty() {
-            return Err(ApplicationError::ValidationError(
-                "Character has no linked world info".to_string(),
-            ));
-        }
-        let Some(embedded_book) = character.data.character_book.as_ref() else {
-            return Err(ApplicationError::ValidationError(
-                "Character has no embedded world info".to_string(),
-            ));
-        };
-
-        let world_info = character_book_to_world_info(embedded_book)?;
-        self.world_info_repository
-            .save_world_info(&world_name, &world_info)
-            .await?;
-
-        Ok(ResolveCharacterLorebookConflictResultDto {
-            affected_world: Some(world_name.clone()),
-            world: world_name,
-            world_written: true,
-        })
-    }
-
-    async fn resolve_lorebook_conflict_with_copy(
-        &self,
-        name: &str,
-    ) -> Result<ResolveCharacterLorebookConflictResultDto, ApplicationError> {
-        let character = self.repository.find_by_name(name).await?;
-        let world_name = character.data.extensions.world.clone();
-        let Some(embedded_book) = character.data.character_book.as_ref() else {
-            return Err(ApplicationError::ValidationError(
-                "Character has no embedded world info".to_string(),
-            ));
-        };
-
-        let world_info = character_book_to_world_info(embedded_book)?;
-        let preferred_name = Self::resolve_embedded_world_name(&character, embedded_book);
-        let (copied_world, should_save) = self
-            .resolve_available_world_copy_name(&preferred_name, &world_info)
-            .await?;
-
-        if should_save {
-            self.world_info_repository
-                .save_world_info(&copied_world, &world_info)
-                .await?;
-        }
-
-        let current_available = !world_name.is_empty()
-            && self
-                .world_info_repository
-                .get_world_info(&world_name, false)
-                .await?
-                .is_some();
-        let linked_world = if current_available {
-            self.resolve_lorebook_conflict_with_current_world(name)
-                .await?;
-            world_name
-        } else {
-            self.clear_unavailable_lorebook_binding(name).await?;
-            String::new()
-        };
-
-        Ok(ResolveCharacterLorebookConflictResultDto {
-            world: linked_world,
-            affected_world: Some(copied_world),
-            world_written: should_save,
-        })
-    }
-
-    async fn clear_unavailable_lorebook_binding(&self, name: &str) -> Result<(), ApplicationError> {
-        let raw_json = self.repository.read_character_card_json(name).await?;
-        let mut card_value = card_contract::parse_character_card_json(&raw_json)?;
-        if let Some(data) = card_value.get_mut("data").and_then(Value::as_object_mut) {
-            data.remove("character_book");
-        }
-        let world = card_value
-            .pointer_mut("/data/extensions/world")
-            .ok_or_else(|| {
-                ApplicationError::ValidationError("Character has no linked world info".to_string())
-            })?;
-        *world = Value::String(String::new());
-        self.write_character_card_value(
-            name,
-            card_value,
-            None,
-            None,
-            CharacterCardValidationMode::ReadableOnly,
-            CharacterCardLorebookMaterializationMode::Skip,
-        )
-        .await?;
-        Ok(())
-    }
-
-    fn character_book_display_name(character_book: &Value) -> Option<String> {
-        character_book
-            .get("name")
-            .and_then(Value::as_str)
-            .filter(|value| !value.trim().is_empty())
-            .map(ToString::to_string)
-    }
-
-    fn canonical_character_book_for_compare(character_book: &Value) -> Result<Value, DomainError> {
-        let world_info = character_book_to_world_info(character_book)?;
-        Self::canonical_world_info_for_compare(&world_info)
-    }
-
-    fn canonical_world_info_for_compare(world_info: &Value) -> Result<Value, DomainError> {
-        let mut character_book = world_info_to_character_book("", world_info)?;
-        if let Some(character_book_object) = character_book.as_object_mut() {
-            character_book_object.remove("name");
-        }
-
-        Ok(character_book)
-    }
-
-    async fn materialize_primary_lorebook(
-        &self,
-        character: &mut Character,
-    ) -> Result<bool, DomainError> {
-        let world_name = character.data.extensions.world.clone();
-        if world_name.is_empty() {
-            let removed = character.data.character_book.take().is_some();
-            return Ok(removed);
-        }
-
-        self.materialize_lorebook(character, &world_name).await
-    }
-
     async fn materialize_create_lorebook(
         &self,
         character: &mut Character,
         primary_lorebook: Option<&str>,
-    ) -> Result<(), DomainError> {
+    ) {
         let Some(world_name) = primary_lorebook.filter(|value| !value.is_empty()) else {
-            return Ok(());
+            return;
         };
 
-        let Some(world_info) = self
-            .world_info_repository
-            .get_world_info(world_name, false)
-            .await?
-        else {
-            tracing::warn!(
-                "Failed to read world info file: {}. Character book will not be available.",
+        let materialized = match self.world_info_repository.get_world_info(world_name).await {
+            Ok(Some(world_info)) => {
+                Self::apply_materialized_lorebook(character, world_name, &world_info)
+            }
+            Ok(None) => Err(DomainError::NotFound(format!(
+                "World info file {} doesn't exist",
                 world_name
-            );
-            return Ok(());
+            ))),
+            Err(error) => Err(error),
         };
 
-        Self::apply_materialized_lorebook(character, world_name, &world_info)?;
-        Ok(())
-    }
-
-    async fn materialize_lorebook(
-        &self,
-        character: &mut Character,
-        world_name: &str,
-    ) -> Result<bool, DomainError> {
-        let world_info = self
-            .world_info_repository
-            .get_world_info(world_name, false)
-            .await?
-            .ok_or_else(|| {
-                DomainError::NotFound(format!("World info file {} doesn't exist", world_name))
-            })?;
-
-        Self::apply_materialized_lorebook(character, world_name, &world_info)
+        if let Err(error) = materialized {
+            tracing::error!(
+                target: tt_contracts::observability::USER_VISIBLE_ERROR,
+                "Creating character '{}' without embedding lorebook '{}': {}",
+                character.name,
+                world_name,
+                error
+            );
+        }
     }
 
     fn apply_materialized_lorebook(
         character: &mut Character,
         world_name: &str,
         world_info: &Value,
-    ) -> Result<bool, DomainError> {
-        let character_book = world_info_to_character_book(world_name, world_info)?;
-
-        if character.data.character_book.as_ref() == Some(&character_book) {
-            return Ok(false);
-        }
-
-        character.data.character_book = Some(character_book);
-        Ok(true)
-    }
-
-    async fn try_auto_import_embedded_world_info(
-        &self,
-        character: &mut Character,
     ) -> Result<(), DomainError> {
-        let Some(character_book) = character.data.character_book.clone() else {
-            return Ok(());
-        };
-
-        let converted_world = character_book_to_world_info(&character_book).map_err(|error| {
-            DomainError::InvalidData(format!(
-                "Embedded world info import failed for {}: {}",
-                character.name, error
-            ))
-        })?;
-
-        let preferred_name = Self::resolve_embedded_world_name(character, &character_book);
-        let (world_name, should_save) = self
-            .resolve_available_world_name(&preferred_name, &converted_world)
-            .await?;
-
-        if should_save {
-            self.world_info_repository
-                .save_world_info(&world_name, &converted_world)
-                .await?;
-        }
-
-        if character.data.extensions.world != world_name {
-            character.data.extensions.world = world_name;
-            self.repository.update(character).await?;
-        }
-
+        let character_book = world_info_to_character_book(world_name, world_info)?;
+        character.data.character_book = Some(character_book);
         Ok(())
-    }
-
-    fn resolve_embedded_world_name(character: &Character, character_book: &Value) -> String {
-        if !character.data.extensions.world.is_empty() {
-            return character.data.extensions.world.clone();
-        }
-
-        if let Some(book_name) = character_book.get("name").and_then(Value::as_str)
-            && !book_name.is_empty()
-        {
-            return book_name.to_string();
-        }
-
-        format!("{}'s Lorebook", character.name)
-    }
-
-    async fn resolve_available_world_name(
-        &self,
-        preferred_name: &str,
-        payload: &Value,
-    ) -> Result<(String, bool), DomainError> {
-        let base_name = sanitize_world_info_name(preferred_name);
-        if base_name.is_empty() {
-            return Err(DomainError::InvalidData(
-                "Embedded world info name is invalid".to_string(),
-            ));
-        }
-
-        let existing = self
-            .world_info_repository
-            .get_world_info(&base_name, false)
-            .await?;
-
-        if let Some(existing_payload) = existing {
-            if existing_payload.get("entries") == payload.get("entries") {
-                return Ok((base_name, false));
-            }
-
-            let names: HashSet<String> = self
-                .world_info_repository
-                .list_world_names()
-                .await?
-                .into_iter()
-                .collect();
-            let base_candidate = Self::strip_trailing_index_suffix(&base_name);
-            for suffix in 2..100_000 {
-                let candidate = Self::indexed_world_name(base_candidate, suffix)?;
-                if !names.contains(&candidate) {
-                    return Ok((candidate, true));
-                }
-            }
-
-            return Err(DomainError::InvalidData(
-                "Unable to allocate an embedded world info name".to_string(),
-            ));
-        }
-
-        Ok((base_name, true))
-    }
-
-    async fn resolve_available_world_copy_name(
-        &self,
-        preferred_name: &str,
-        payload: &Value,
-    ) -> Result<(String, bool), DomainError> {
-        let base_name = sanitize_world_info_name(preferred_name);
-        if base_name.is_empty() {
-            return Err(DomainError::InvalidData(
-                "Embedded world info name is invalid".to_string(),
-            ));
-        }
-
-        let payload_canonical = Self::canonical_world_info_for_compare(payload)?;
-        self.resolve_available_suffixed_world_name(
-            Self::strip_trailing_index_suffix(&base_name),
-            &payload_canonical,
-        )
-        .await
-    }
-
-    async fn resolve_available_suffixed_world_name(
-        &self,
-        base_name: &str,
-        payload_canonical: &Value,
-    ) -> Result<(String, bool), DomainError> {
-        for suffix in 2..100_000 {
-            let candidate = Self::indexed_world_name(base_name, suffix)?;
-            match self
-                .world_info_repository
-                .get_world_info(&candidate, false)
-                .await?
-            {
-                Some(candidate_payload)
-                    if Self::canonical_world_info_for_compare(&candidate_payload)?
-                        == *payload_canonical =>
-                {
-                    return Ok((candidate, false));
-                }
-                Some(_) => continue,
-                None => return Ok((candidate, true)),
-            }
-        }
-
-        Err(DomainError::InvalidData(
-            "Unable to allocate a world info copy name".to_string(),
-        ))
-    }
-
-    fn strip_trailing_index_suffix(name: &str) -> &str {
-        let trimmed = name.trim_end();
-        let Some(close_paren) = trimmed.rfind(')') else {
-            return name;
-        };
-        let Some(open_paren) = trimmed[..close_paren].rfind('(') else {
-            return name;
-        };
-        let prefix = trimmed[..open_paren].trim_end();
-        let digits = trimmed[open_paren + 1..close_paren].trim();
-        if close_paren + 1 != trimmed.len()
-            || prefix.is_empty()
-            || digits.is_empty()
-            || !digits.chars().all(|character| character.is_ascii_digit())
-        {
-            return name;
-        }
-
-        prefix
-    }
-
-    fn indexed_world_name(base_name: &str, index: usize) -> Result<String, DomainError> {
-        let suffix = format!(" ({index})");
-        let max_base_bytes = MAX_SANITIZED_FILENAME_BYTES
-            .checked_sub(WORLD_INFO_EXTENSION.len() + 1 + suffix.len())
-            .ok_or_else(|| {
-                DomainError::InvalidData("World info name suffix is too long".to_string())
-            })?;
-        let mut end = base_name.len().min(max_base_bytes);
-        while !base_name.is_char_boundary(end) {
-            end -= 1;
-        }
-
-        let candidate = sanitize_world_info_name(&format!("{}{suffix}", &base_name[..end]));
-        if candidate.is_empty() {
-            return Err(DomainError::InvalidData(
-                "Unable to allocate a world info copy name".to_string(),
-            ));
-        }
-
-        Ok(candidate)
     }
 
     async fn build_export_card_value(&self, name: &str) -> Result<Value, DomainError> {
@@ -1385,12 +826,19 @@ impl CharacterService {
             ))
         })?;
 
-        self.materialize_primary_lorebook_value(&mut export_value)
-            .await?;
-        card_contract::normalize_v2_creator_metadata_projection(&mut export_value)?;
-        card_contract::normalize_v2_character_book_extensions(&mut export_value)?;
+        if let Err(error) = self
+            .materialize_primary_lorebook_value(&mut export_value)
+            .await
+        {
+            tracing::error!(
+                target: tt_contracts::observability::USER_VISIBLE_ERROR,
+                "Exporting character '{}' with its stored embedded lorebook because the linked lorebook could not be refreshed: {}",
+                name,
+                error
+            );
+        }
         card_contract::unset_private_fields(&mut export_value)?;
-        card_contract::sanitize_agent_profiles_for_export(&mut export_value)?;
+        card_contract::sanitize_agent_profiles_for_export(&mut export_value);
 
         Ok(export_value)
     }
@@ -1399,21 +847,19 @@ impl CharacterService {
         &self,
         export_value: &mut Value,
     ) -> Result<(), DomainError> {
-        let world_name = export_value
+        let Some(world_name) = export_value
             .pointer("/data/extensions/world")
             .and_then(Value::as_str)
-            .unwrap_or("");
-
+        else {
+            return Ok(());
+        };
         if world_name.is_empty() {
-            if let Some(data_object) = export_value.get_mut("data").and_then(Value::as_object_mut) {
-                data_object.remove("character_book");
-            }
             return Ok(());
         }
 
         let world_info = self
             .world_info_repository
-            .get_world_info(world_name, false)
+            .get_world_info(world_name)
             .await?
             .ok_or_else(|| {
                 DomainError::NotFound(format!("World info file {} doesn't exist", world_name))

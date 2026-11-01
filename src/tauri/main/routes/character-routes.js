@@ -123,12 +123,12 @@ export function registerCharacterRoutes(router, context, { jsonResponse, textRes
     router.post('/api/characters/create', async ({ body, url }) => {
         if (body instanceof FormData) {
             const outcome = await context.createCharacterFromForm(body, url);
-            await context.getAllCharacters({ shallow: true, forceRefresh: true });
+            context.invalidateCharacterCache();
             return createCharacterResponse(outcome, textResponse);
         }
 
         const outcome = await context.createCharacterFromPayload(body);
-        await context.getAllCharacters({ shallow: true, forceRefresh: true });
+        context.invalidateCharacterCache();
         return createCharacterResponse(outcome, textResponse);
     });
 
@@ -138,59 +138,8 @@ export function registerCharacterRoutes(router, context, { jsonResponse, textRes
         }
 
         await context.editCharacterFromForm(body, url);
+        context.invalidateCharacterCache();
         return textResponse('ok');
-    });
-
-    router.post('/api/characters/lorebook-conflict', async ({ body }) => {
-        const avatar = pickAvatarIdentity(body);
-        const resolved = await resolveRouteCharacterId(context, { avatar, fallbackName: body?.name });
-        if (resolved.responseBody) {
-            return jsonResponse(resolved.responseBody, 400);
-        }
-
-        const characterId = resolved.characterId;
-        if (!characterId) {
-            return jsonResponse({ error: 'Character not found' }, 404);
-        }
-
-        const result = await context.safeInvoke('check_character_lorebook_conflict', {
-            dto: { name: characterId },
-        });
-
-        return jsonResponse(result);
-    });
-
-    router.post('/api/characters/resolve-lorebook-conflict', async ({ body }) => {
-        const avatar = pickAvatarIdentity(body);
-        const resolution = typeof body?.resolution === 'string' ? body.resolution : '';
-        const conflictToken = typeof body?.conflict_token === 'string' ? body.conflict_token : '';
-        if (!['current', 'embedded', 'copy'].includes(resolution)) {
-            return jsonResponse({ error: 'Invalid lorebook conflict resolution' }, 400);
-        }
-        if (resolution === 'copy' && !conflictToken) {
-            return jsonResponse({ error: 'Missing lorebook conflict token' }, 400);
-        }
-
-        const resolved = await resolveRouteCharacterId(context, { avatar, fallbackName: body?.name });
-        if (resolved.responseBody) {
-            return jsonResponse(resolved.responseBody, 400);
-        }
-
-        const characterId = resolved.characterId;
-        if (!characterId) {
-            return jsonResponse({ error: 'Character not found' }, 404);
-        }
-
-        const result = await context.safeInvoke('resolve_character_lorebook_conflict', {
-            dto: {
-                name: characterId,
-                resolution,
-                conflict_token: conflictToken || null,
-            },
-        });
-
-        await context.getAllCharacters({ shallow: true, forceRefresh: true });
-        return jsonResponse(result);
     });
 
     router.post('/api/characters/edit-avatar', async ({ body, url }) => {
@@ -199,6 +148,7 @@ export function registerCharacterRoutes(router, context, { jsonResponse, textRes
         }
 
         await context.editCharacterAvatarFromForm(body, url);
+        context.invalidateCharacterCache();
         return textResponse('OK');
     });
 
@@ -221,7 +171,7 @@ export function registerCharacterRoutes(router, context, { jsonResponse, textRes
             },
         });
 
-        await context.getAllCharacters({ shallow: true, forceRefresh: true });
+        context.invalidateCharacterCache();
         return jsonResponse({ ok: true });
     });
 
@@ -246,7 +196,7 @@ export function registerCharacterRoutes(router, context, { jsonResponse, textRes
         });
 
         const normalized = context.normalizeCharacter(renamed);
-        await context.getAllCharacters({ shallow: true, forceRefresh: true });
+        context.invalidateCharacterCache();
         return jsonResponse(normalized);
     });
 
@@ -275,7 +225,7 @@ export function registerCharacterRoutes(router, context, { jsonResponse, textRes
             dto: { name: originalCharacterId },
         });
         const normalized = context.normalizeCharacter(created);
-        await context.getAllCharacters({ shallow: true, forceRefresh: true });
+        context.invalidateCharacterCache();
 
         return jsonResponse({ path: normalized.avatar });
     });
@@ -307,7 +257,7 @@ export function registerCharacterRoutes(router, context, { jsonResponse, textRes
                     filter: body.filter ?? null,
                 },
             });
-            await context.getAllCharacters({ shallow: true, forceRefresh: true });
+            context.invalidateCharacterCache();
             return jsonResponse(result);
         }
 
@@ -340,7 +290,7 @@ export function registerCharacterRoutes(router, context, { jsonResponse, textRes
                 update,
             },
         });
-        await context.getAllCharacters({ shallow: true, forceRefresh: true });
+        context.invalidateCharacterCache();
 
         return jsonResponse({ ok: true });
     });
@@ -372,14 +322,12 @@ export function registerCharacterRoutes(router, context, { jsonResponse, textRes
             },
         });
 
-        const payload = normalizeBinaryPayload(exported?.data);
+        const payload = normalizeBinaryPayload(exported);
         if (normalizedFormat === 'png' && payload.byteLength === 0) {
             return jsonResponse({ error: 'Character export payload is empty' }, 500);
         }
 
-        const contentType = String(
-            exported?.mime_type || (normalizedFormat === 'png' ? 'image/png' : 'application/json'),
-        );
+        const contentType = normalizedFormat === 'png' ? 'image/png' : 'application/json';
         const fallbackName = `${characterId}.${normalizedFormat}`;
         const rawDownloadName = String(avatar || fallbackName).replace(/\.png$/i, `.${normalizedFormat}`);
         const downloadName = sanitizeAttachmentFileName(rawDownloadName, fallbackName);

@@ -1,29 +1,24 @@
-use std::{io::SeekFrom, path::Path};
+use std::path::Path;
 
 use async_trait::async_trait;
 use serde_json::Value;
-use tokio::{
-    fs,
-    io::{AsyncReadExt, AsyncSeekExt},
-};
+use tokio::fs;
 
 use crate::png_card_metadata::{
-    process_avatar_image, read_character_data_from_png, write_character_data_to_png,
+    process_avatar_image, read_character_data_from_png, read_character_data_from_png_file,
+    write_character_data_to_png,
 };
-use tt_adapter_storage_core::file_system::{replace_file_with_fallback, unique_temp_path};
+use tt_adapter_storage_core::file_system::{replace_file, unique_temp_path};
 use tt_contracts::client_asset_paths::validate_path_segment;
 use tt_domain::errors::DomainError;
 use tt_domain::json_merge::merge_json_value;
-use tt_domain::models::{character::Character, chat::parse_message_timestamp_value};
+use tt_domain::models::character::Character;
 use tt_ports::repositories::character_repository::{
     CHARACTER_CREATE_WARNING_AVATAR_IMPORT_FAILED, CharacterChat, CharacterCreateResult,
     CharacterCreateWarning, CharacterRepository, ImageCrop,
 };
-use tt_ports::repositories::chat_repository::{ChatRepository, ChatSearchResult};
 
 use super::{FileCharacterRepository, importer::CharacterImportMode};
-
-const CHARACTER_CHAT_TAIL_SCAN_BUFFER_BYTES: usize = 64 * 1024;
 
 struct CreateAvatarCarrier {
     image_data: Vec<u8>,
@@ -57,21 +52,7 @@ impl FileCharacterRepository {
             );
             DomainError::InternalError(format!("Failed to write character temp file: {error}"))
         })?;
-        replace_file_with_fallback(&temp_path, file_path).await
-    }
-
-    fn with_storage_identity_and_json(
-        character: &Character,
-        file_name: &str,
-        json_data: Option<String>,
-    ) -> Character {
-        let mut stored = character.clone();
-        stored.file_name = Some(file_name.to_string());
-        stored.avatar = format!("{}.png", file_name);
-        stored.json_data = json_data;
-        stored.shallow = false;
-        stored.data_size = Self::calculate_data_size(&stored.to_v2().data);
-        stored
+        replace_file(&temp_path, file_path).await
     }
 
     pub(crate) async fn discard_character_read_cache(&self, file_name: &str) {
@@ -216,139 +197,6 @@ impl FileCharacterRepository {
         }
     }
 
-    async fn character_chat_from_summary(
-        chat_dir: &Path,
-        summary: ChatSearchResult,
-    ) -> Result<CharacterChat, DomainError> {
-        let path = chat_dir.join(&summary.file_name);
-        let (last_message, last_message_date) =
-            Self::read_last_message_from_chat_file(&path, summary.date).await?;
-
-        Ok(CharacterChat {
-            file_name: summary.file_name,
-            file_size: format!("{:.2}kb", summary.file_size as f64 / 1024.0),
-            chat_items: summary.message_count,
-            last_message,
-            last_message_date,
-        })
-    }
-
-    async fn read_last_message_from_chat_file(
-        path: &Path,
-        fallback_date: i64,
-    ) -> Result<(String, i64), DomainError> {
-        let Some(line) = Self::read_last_non_empty_chat_line(path).await? else {
-            return Ok(("[The chat is empty]".to_string(), fallback_date));
-        };
-
-        let json = match serde_json::from_slice::<Value>(&line) {
-            Ok(json) => json,
-            Err(_) => return Ok(("[Invalid chat format]".to_string(), fallback_date)),
-        };
-
-        let message = json
-            .get("mes")
-            .and_then(Value::as_str)
-            .unwrap_or("[The chat is empty]")
-            .to_string();
-        let parsed_date = parse_message_timestamp_value(json.get("send_date"));
-        let last_message_date = if parsed_date > 0 {
-            parsed_date
-        } else {
-            fallback_date
-        };
-
-        Ok((message, last_message_date))
-    }
-
-    async fn read_last_non_empty_chat_line(path: &Path) -> Result<Option<Vec<u8>>, DomainError> {
-        let mut file = fs::File::open(path).await.map_err(|e| {
-            DomainError::InternalError(format!(
-                "Failed to open chat file '{}': {}",
-                path.display(),
-                e
-            ))
-        })?;
-        let metadata = file.metadata().await.map_err(|e| {
-            DomainError::InternalError(format!(
-                "Failed to read chat metadata '{}': {}",
-                path.display(),
-                e
-            ))
-        })?;
-
-        let mut position = metadata.len();
-        if position == 0 {
-            return Ok(None);
-        }
-
-        let mut reversed_line = Vec::new();
-        while position > 0 {
-            let read_len = position.min(CHARACTER_CHAT_TAIL_SCAN_BUFFER_BYTES as u64) as usize;
-            position -= read_len as u64;
-            file.seek(SeekFrom::Start(position)).await.map_err(|e| {
-                DomainError::InternalError(format!(
-                    "Failed to seek chat file '{}': {}",
-                    path.display(),
-                    e
-                ))
-            })?;
-
-            let mut buffer = vec![0_u8; read_len];
-            file.read_exact(&mut buffer).await.map_err(|e| {
-                DomainError::InternalError(format!(
-                    "Failed to read chat file '{}': {}",
-                    path.display(),
-                    e
-                ))
-            })?;
-
-            for &byte in buffer.iter().rev() {
-                if byte == b'\n' {
-                    if let Some(line) = Self::finish_reversed_chat_line(path, &mut reversed_line)? {
-                        return Ok(Some(line));
-                    }
-                } else {
-                    reversed_line.push(byte);
-                }
-            }
-        }
-
-        Self::finish_reversed_chat_line(path, &mut reversed_line)
-    }
-
-    fn finish_reversed_chat_line(
-        path: &Path,
-        reversed_line: &mut Vec<u8>,
-    ) -> Result<Option<Vec<u8>>, DomainError> {
-        if reversed_line.is_empty() {
-            return Ok(None);
-        }
-
-        reversed_line.reverse();
-        let mut line = std::mem::take(reversed_line);
-        Self::trim_trailing_carriage_returns(&mut line);
-        let text = std::str::from_utf8(&line).map_err(|e| {
-            DomainError::InternalError(format!(
-                "Failed to decode chat line '{}': {}",
-                path.display(),
-                e
-            ))
-        })?;
-
-        if text.trim().is_empty() {
-            Ok(None)
-        } else {
-            Ok(Some(line))
-        }
-    }
-
-    fn trim_trailing_carriage_returns(line: &mut Vec<u8>) {
-        while line.last() == Some(&b'\r') {
-            line.pop();
-        }
-    }
-
     pub(super) fn parse_card_json(json_data: &str, context: &str) -> Result<Value, DomainError> {
         let value: Value = serde_json::from_str(json_data)
             .map_err(|e| DomainError::InvalidData(format!("Failed to parse {}: {}", context, e)))?;
@@ -443,16 +291,6 @@ impl FileCharacterRepository {
         )
     }
 
-    fn merge_existing_character_projection_into_card_json(
-        json_data: &str,
-        character: &Character,
-        context: &str,
-    ) -> Result<String, DomainError> {
-        let mut card_value = Self::parse_card_json(json_data, context)?;
-        Self::merge_existing_character_projection_into_card_value(&mut card_value, character)?;
-        Self::serialize_card_value(&card_value, context)
-    }
-
     fn merge_create_character_projection_into_card_json(
         json_data: &str,
         character: &Character,
@@ -471,45 +309,6 @@ impl FileCharacterRepository {
 
 #[async_trait]
 impl CharacterRepository for FileCharacterRepository {
-    async fn save(&self, character: &Character) -> Result<(), DomainError> {
-        self.ensure_directory_exists().await?;
-
-        let file_name = character.get_file_name();
-        let file_path = self.get_character_path(&file_name);
-
-        let image_data = if file_path.exists() {
-            fs::read(&file_path).await.map_err(|e| {
-                tracing::error!("Failed to read character file: {}", e);
-                DomainError::InternalError(format!("Failed to read character file: {}", e))
-            })?
-        } else {
-            self.read_default_avatar().await?
-        };
-
-        let json_data = if file_path.exists() {
-            let raw_json = read_character_data_from_png(&image_data)?;
-            Self::merge_existing_character_projection_into_card_json(
-                &raw_json,
-                character,
-                "stored character card",
-            )?
-        } else {
-            Self::serialize_character_card(character)?
-        };
-
-        let new_image_data = write_character_data_to_png(&image_data, &json_data)?;
-
-        Self::replace_character_png_file(&file_path, &new_image_data).await?;
-
-        let cached_character =
-            Self::with_storage_identity_and_json(character, &file_name, Some(json_data));
-
-        self.publish_character_write(file_name, cached_character)
-            .await;
-
-        Ok(())
-    }
-
     async fn find_by_name(&self, name: &str) -> Result<Character, DomainError> {
         let cached = {
             let cache = self.memory_cache.lock().await;
@@ -554,24 +353,44 @@ impl CharacterRepository for FileCharacterRepository {
                 name
             )));
         }
+        let chat_dir = if delete_chats {
+            match self.resolve_chat_directory(name).await {
+                Ok(path) => Some(path),
+                Err(error) => {
+                    tracing::error!(
+                        target: tt_contracts::observability::USER_VISIBLE_ERROR,
+                        "Deleting character '{}' without deleting its chats: {}",
+                        name,
+                        error
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
 
         fs::remove_file(&file_path).await.map_err(|e| {
             tracing::error!("Failed to delete character file: {}", e);
             DomainError::InternalError(format!("Failed to delete character file: {}", e))
         })?;
 
+        if let Some(chat_dir) = chat_dir
+            && chat_dir.exists()
+            && let Err(error) = fs::remove_dir_all(&chat_dir).await
+        {
+            tracing::error!(
+                target: tt_contracts::observability::USER_VISIBLE_ERROR,
+                "Deleted character '{}' but could not delete its chat directory: {}",
+                name,
+                error
+            );
+        }
         if delete_chats {
-            let chat_dir = self.resolve_chat_directory(name).await?;
-            if chat_dir.exists() {
-                fs::remove_dir_all(&chat_dir).await.map_err(|e| {
-                    tracing::error!("Failed to delete chat directory: {}", e);
-                    DomainError::InternalError(format!("Failed to delete chat directory: {}", e))
-                })?;
-            }
             self.chat_repository
                 .invalidate_all_payload_signatures()
                 .await;
-            self.chat_repository.clear_chat_summary_index().await?;
+            self.chat_repository.clear_chat_summary_index().await;
         }
 
         {
@@ -581,20 +400,6 @@ impl CharacterRepository for FileCharacterRepository {
         self.clear_shallow_index_cache().await;
 
         Ok(())
-    }
-
-    async fn update(&self, character: &Character) -> Result<(), DomainError> {
-        let file_name = character.get_file_name();
-        let file_path = self.get_character_path(&file_name);
-
-        if !file_path.exists() {
-            return Err(DomainError::NotFound(format!(
-                "Character not found: {}",
-                file_name
-            )));
-        }
-
-        self.save(character).await
     }
 
     async fn write_character_card_json(
@@ -690,15 +495,10 @@ impl CharacterRepository for FileCharacterRepository {
         let data_value = card_object
             .entry("data")
             .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
-
-        let data_object = data_value.as_object_mut().ok_or_else(|| {
-            DomainError::InvalidData("Character card data field is invalid".to_string())
-        })?;
-
-        data_object.insert(
-            "name".to_string(),
-            serde_json::Value::String(new_name.to_string()),
-        );
+        if !data_value.is_object() {
+            *data_value = serde_json::Value::Object(serde_json::Map::new());
+        }
+        data_value["name"] = serde_json::Value::String(new_name.to_string());
 
         let patched_json = serde_json::to_string(&card_value).map_err(|e| {
             tracing::error!("Failed to serialize character data: {}", e);
@@ -722,7 +522,7 @@ impl CharacterRepository for FileCharacterRepository {
             self.chat_repository
                 .invalidate_all_payload_signatures()
                 .await;
-            self.chat_repository.clear_chat_summary_index().await?;
+            self.chat_repository.clear_chat_summary_index().await;
         }
 
         if old_path != new_path {
@@ -798,7 +598,7 @@ impl CharacterRepository for FileCharacterRepository {
         &self,
         file_path: &Path,
         name: &str,
-        primary_lorebook: Option<&str>,
+        primary_lorebook: &str,
     ) -> Result<Character, DomainError> {
         self.ensure_directory_exists().await?;
         if !validate_path_segment(name) {
@@ -827,51 +627,6 @@ impl CharacterRepository for FileCharacterRepository {
         Ok(character)
     }
 
-    async fn export_character(
-        &self,
-        name: &str,
-        target_path: &Path,
-        character_card_json: &str,
-    ) -> Result<(), DomainError> {
-        let extension = target_path
-            .extension()
-            .and_then(|value| value.to_str())
-            .unwrap_or("")
-            .to_ascii_lowercase();
-
-        match extension.as_str() {
-            "png" => {
-                let png_bytes = self
-                    .export_character_png_bytes(name, character_card_json)
-                    .await?;
-                fs::write(target_path, png_bytes).await.map_err(|error| {
-                    tracing::error!("Failed to write exported character PNG: {}", error);
-                    DomainError::InternalError(format!(
-                        "Failed to write exported character PNG: {}",
-                        error
-                    ))
-                })?;
-                Ok(())
-            }
-            "json" => {
-                fs::write(target_path, character_card_json.as_bytes())
-                    .await
-                    .map_err(|error| {
-                        tracing::error!("Failed to write exported character JSON: {}", error);
-                        DomainError::InternalError(format!(
-                            "Failed to write exported character JSON: {}",
-                            error
-                        ))
-                    })?;
-                Ok(())
-            }
-            _ => Err(DomainError::InvalidData(format!(
-                "Unsupported file format: {}",
-                extension
-            ))),
-        }
-    }
-
     async fn read_character_card_json(&self, name: &str) -> Result<String, DomainError> {
         let file_path = self.get_character_path(name);
         if !file_path.exists() {
@@ -881,16 +636,7 @@ impl CharacterRepository for FileCharacterRepository {
             )));
         }
 
-        let image_data = fs::read(&file_path).await.map_err(|error| {
-            tracing::error!(
-                "Failed to read character file {}: {}",
-                file_path.display(),
-                error
-            );
-            DomainError::InternalError(format!("Failed to read character file: {}", error))
-        })?;
-
-        read_character_data_from_png(&image_data)
+        read_character_data_from_png_file(&file_path).await
     }
 
     async fn export_character_png_bytes(
@@ -951,8 +697,14 @@ impl CharacterRepository for FileCharacterRepository {
 
         Self::replace_character_png_file(&file_path, &new_image_data).await?;
 
-        let stored_character =
-            Self::with_storage_identity_and_json(character, &file_name, Some(json_data));
+        let card_value = Self::parse_card_json(&json_data, "created character card")?;
+        let mut stored_character = character.clone();
+        stored_character.file_name = Some(file_name.clone());
+        stored_character.avatar = format!("{}.png", file_name);
+        stored_character.data_size =
+            Self::calculate_character_data_size(&card_value, &stored_character);
+        stored_character.json_data = Some(json_data);
+        stored_character.shallow = false;
 
         self.publish_character_write(file_name, stored_character.clone())
             .await;
@@ -963,60 +715,17 @@ impl CharacterRepository for FileCharacterRepository {
         })
     }
 
-    async fn update_avatar(
-        &self,
-        character: &Character,
-        avatar_path: &Path,
-        crop: Option<ImageCrop>,
-    ) -> Result<(), DomainError> {
-        let file_name = character.get_file_name();
-        let file_path = self.get_character_path(&file_name);
-        if !file_path.exists() {
-            return Err(DomainError::NotFound(format!(
-                "Character not found: {}",
-                file_name
-            )));
-        }
-
-        let existing_image_data = fs::read(&file_path).await.map_err(|e| {
-            tracing::error!("Failed to read character file: {}", e);
-            DomainError::InternalError(format!("Failed to read character file: {}", e))
-        })?;
-        let raw_json = read_character_data_from_png(&existing_image_data)?;
-        let json_data = Self::merge_existing_character_projection_into_card_json(
-            &raw_json,
-            character,
-            "stored character card",
-        )?;
-
-        let file_data = fs::read(avatar_path).await.map_err(|e| {
-            tracing::error!("Failed to read avatar file: {}", e);
-            DomainError::InternalError(format!("Failed to read avatar file: {}", e))
-        })?;
-        let image_data = process_avatar_image(file_data, crop).await?;
-        let new_image_data = write_character_data_to_png(&image_data, &json_data)?;
-
-        Self::replace_character_png_file(&file_path, &new_image_data).await?;
-
-        let cached_character =
-            Self::with_storage_identity_and_json(character, &file_name, Some(json_data));
-        self.publish_character_write(file_name.clone(), cached_character)
-            .await;
-        Ok(())
-    }
-
     async fn get_character_chats(
         &self,
         name: &str,
         simple: bool,
     ) -> Result<Vec<CharacterChat>, DomainError> {
-        let chat_dir = self.resolve_chat_directory(name).await?;
-
-        if !chat_dir.exists() {
-            return Ok(Vec::new());
-        }
-
         if simple {
+            let chat_dir = self.resolve_chat_directory(name).await?;
+            if !chat_dir.exists() {
+                return Ok(Vec::new());
+            }
+
             let mut entries = fs::read_dir(&chat_dir).await.map_err(|e| {
                 tracing::error!("Failed to read chat directory: {}", e);
                 DomainError::InternalError(format!("Failed to read chat directory: {}", e))
@@ -1051,15 +760,19 @@ impl CharacterRepository for FileCharacterRepository {
 
         let summaries = self
             .chat_repository
-            .list_chat_summaries(Some(name), false)
+            .list_chat_summaries_with_full_text(name)
             .await?;
 
-        let mut chats = Vec::with_capacity(summaries.len());
-        for summary in summaries {
-            chats.push(Self::character_chat_from_summary(&chat_dir, summary).await?);
-        }
-
-        Ok(chats)
+        Ok(summaries
+            .into_iter()
+            .map(|(summary, last_message)| CharacterChat {
+                file_name: summary.file_name,
+                file_size: format!("{:.2}kb", summary.file_size as f64 / 1024.0),
+                chat_items: summary.message_count,
+                last_message: last_message.unwrap_or_else(|| "[The chat is empty]".to_string()),
+                last_message_date: summary.date,
+            })
+            .collect())
     }
 
     async fn clear_cache(&self) -> Result<(), DomainError> {

@@ -15,7 +15,7 @@ use http::StatusCode;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tt_application::dto::chat_history_dto::{ChatHistoryLocator, CurrentCommitReason};
-use tt_ports::repositories::chat_payload_commit_repository::{
+use tt_ports::repositories::chat_commit_repository::{ChatCommitOperation,
     ChatPayloadPrecondition, ChatPayloadVersion,
 };
 
@@ -238,7 +238,7 @@ pub async fn save_group_chat(
     .await
 }
 
-fn precondition(
+pub(crate) fn precondition(
     force: bool,
     version: Option<VersionToken>,
     is_new: bool,
@@ -267,9 +267,8 @@ async fn commit_payload(
         return Err(ServerError::BadRequest("Chat payload is empty".into()));
     }
 
-    let commit = state.services.chat_payload_commit_service.clone();
-
-    let session = commit.begin(locator, precondition).await?;
+    let commit = state.services.chat_commit_service.clone();
+    let session = commit.begin_with_precondition(locator, ChatCommitOperation::Payload { force: false, cold_source: None }, precondition).await?;
     let mut bytes = Vec::new();
     for (index, entry) in chat.iter().enumerate() {
         if index > 0 {
@@ -285,15 +284,15 @@ async fn commit_payload(
             offset = commit.append(&session.session_id, offset, frame).await?;
         }
         commit
-            .finish(&session.session_id, offset, CurrentCommitReason::Mutation)
+            .finish_versioned(&session.session_id, offset, CurrentCommitReason::Mutation)
             .await
     }
     .await;
 
     match result {
-        Ok((_size, version)) => Ok(Json(json!({
+        Ok(committed) => Ok(Json(json!({
             "ok": true,
-            "version": VersionToken::from(version),
+            "version": VersionToken::from(committed.version),
         }))
         .into_response()),
         Err(error) => {
@@ -302,10 +301,9 @@ async fn commit_payload(
 
             let server_error = ServerError::from(error);
             if server_error.is_integrity_conflict() {
-                // Exactly upstream's shape: the frontend keys its overwrite
-                // prompt off `{"error":"integrity"}` with status 400.
+                // Preserve the upstream error key while HTTP uses 409 for stale writes.
                 return Ok((
-                    StatusCode::BAD_REQUEST,
+                    StatusCode::CONFLICT,
                     Json(json!({ "error": "integrity" })),
                 )
                     .into_response());

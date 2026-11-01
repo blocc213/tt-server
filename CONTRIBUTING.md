@@ -98,9 +98,17 @@ KISS 要求我们选择能够完整解决当前问题的最简单方案。判断
 - 正例：事实发生变化后重新评估方案，记录理由，并尊重用户已经明确作出的选择。
 - 反例：机械引用某条原则结束讨论，或为了保持原有设计而忽略新的事实。
 
+### 测试准入
+
+测试用于守住可观察行为、非平凡不变式与边界，以及已经发生并修复的具体缺陷。代码变化或覆盖率增加本身不是新增测试的理由。
+
+不要测试源码文本、字面量、显然控制流、直接委托、实现细节或已移除功能。不要提前添加回归测试。优先复用最高层的现有行为覆盖；并发测试使用确定性协调，不依赖 sleep。删除功能或测试后，也应删除失效的 fixture、fake、hook 与依赖。Agent 的具体分层策略见 `docs/Agent/TestingStrategy.md`。
+
 ### 提交 PR 前
 
 提交 PR 前，请阅读本文件，并在 PR 模板中勾选已阅读确认项。
+
+跨模块的结构调整或较大的重构，请先通过 issue 或 draft PR 与维护者对齐方案，再展开实现，避免难以评审的大改动和返工。
 
 其他贡献要求会在后续补充；在此之前，请尽量让变更保持清晰、可 review、可测试。
 
@@ -206,8 +214,16 @@ Use these principles to ask questions and explain decisions. No decision needs t
 - Good: Reassess a design when the facts change, record the reasoning, and respect choices the user has made explicitly.
 - Bad: Cite one principle to end discussion or ignore new evidence in order to preserve an existing design.
 
+### Test Admission
+
+Tests protect observable behavior, non-trivial invariants and boundaries, and concrete defects that have already been fixed. A code change or higher coverage is not, by itself, a reason to add a test.
+
+Do not test source text, literals, obvious control flow, direct delegation, implementation details, or removed features. Do not add regression tests speculatively. Prefer the highest existing behavior boundary, and coordinate concurrency deterministically instead of sleeping. When a feature or test is removed, also remove obsolete fixtures, fakes, hooks, and dependencies. See `docs/Agent/TestingStrategy.md` for Agent-specific layering.
+
 ### Before Opening a PR
 
 Before opening a PR, please read this file and check the confirmation item in the PR template.
+
+For cross-module structural changes or large refactors, please align the approach with the maintainers in an issue or draft PR before implementing it. This keeps the change reviewable and avoids rework.
 
 More contribution requirements will be added later. Until then, please keep changes clear, reviewable, and testable.

@@ -1,7 +1,6 @@
 // @ts-check
 
-import { isMobile } from '../../../RossAscends-mods.js';
-import { isAndroidRuntime, isIosRuntime } from '../../../util/mobile-runtime.js';
+import { hostPlatform, isDesktopHost } from '../../../util/host-identity.js';
 import {
     getChatBackupStorageStats,
     getRuntimePaths,
@@ -9,28 +8,18 @@ import {
     isServerEnv,
 } from '../../../../tauri-bridge.js';
 import { getActiveIosPolicyCapabilities } from '../../../tauritavern/ios-policy.js';
-import {
-    isNativeRegexBackendEnabled,
-    syncNativeRegexBackendEnabledFromSettings,
-} from '../../regex/native-regex-settings.js';
+import { isOledBackgroundEnabled } from '../oled-background.js';
 import { createDataRootState, createTauriTavernSettingsState } from './settings-state.js';
-
-export function isWindowsPlatform() {
-    return typeof navigator !== 'undefined'
-        && /windows/i.test(String(navigator.userAgent || ''));
-}
 
 export function resolveTauriTavernSettingsCapabilities() {
     const iosCaps = getActiveIosPolicyCapabilities();
-    // Data directory selection requires a native desktop host, not a desktop browser user agent.
-    const supportsDataRootSelection = !isServerEnv() && !isAndroidRuntime() && !isIosRuntime();
+    const supportsDataRootSelection = !isServerEnv() && isDesktopHost();
 
     return {
         requestProxyAllowed: iosCaps?.network?.request_proxy !== false,
         lanSyncAllowed: !isServerEnv() && iosCaps?.sync?.lan !== false,
-        supportsCloseToTrayOnClose: !isServerEnv() && isWindowsPlatform() && !isMobile(),
+        supportsCloseToTrayOnClose: !isServerEnv() && hostPlatform() === 'windows',
         supportsDataRootSelection,
-        supportsNativeDevLogs: !isServerEnv(),
     };
 }
 
@@ -63,13 +52,12 @@ export async function loadTauriTavernSettingsViewModel() {
     const { supportsDataRootSelection } = capabilities;
     const runtimePaths = supportsDataRootSelection ? await getRuntimePaths() : null;
 
-    syncNativeRegexBackendEnabledFromSettings(settings);
-
     return {
         capabilities,
         dataRoot: createDataRootState(runtimePaths),
-        values: createTauriTavernSettingsState(settings, {
-            nativeRegexBackendEnabled: isNativeRegexBackendEnabled(),
-        }),
+        values: {
+            ...createTauriTavernSettingsState(settings),
+            oledBackgroundEnabled: isOledBackgroundEnabled(),
+        },
     };
 }

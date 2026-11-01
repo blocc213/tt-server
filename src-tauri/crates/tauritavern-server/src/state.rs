@@ -16,6 +16,16 @@ pub struct AppState {
     /// Same-origin request authority already comes from the session cookie.
     pub csrf_token: String,
     pub upload_staging: SharedUploadStaging,
+    pub browser_resources: crate::browser_resources::BrowserResources,
+    pub templates: std::sync::OnceLock<tt_application::services::bundled_template_service::BundledTemplateService>,
+}
+
+impl AppState {
+    pub fn templates(&self) -> &tt_application::services::bundled_template_service::BundledTemplateService {
+        self.templates.get_or_init(|| tt_application::services::bundled_template_service::BundledTemplateService::new(
+            Arc::new(crate::resources::FrontendTemplateStore(self.frontend_dir.clone())),
+        ))
+    }
 }
 
 pub type SharedState = Arc<AppState>;

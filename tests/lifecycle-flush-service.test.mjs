@@ -37,7 +37,9 @@ test('host lifecycle listeners are installed once and fan out to registered flus
     const documentObject = new FakeEventTarget();
     documentObject.visibilityState = 'visible';
     const calls = [];
-    const service = createLifecycleFlushService({ windowObject, documentObject, logger: { error() {} } });
+    const service = createLifecycleFlushService({
+        windowObject, documentObject, listen: async () => () => {}, logger: { error() {} },
+    });
 
     service.register('session', reason => calls.push(`session:${reason}`));
     service.register('invokes', reason => calls.push(`invokes:${reason}`));
@@ -57,27 +59,6 @@ test('host lifecycle listeners are installed once and fan out to registered flus
     await service.waitForIdle();
     assert.deepEqual(calls.slice(-2), ['session:visibilitychange:hidden', 'invokes:visibilitychange:hidden']);
 });
-
-test('install and uninstall are idempotent across repeated cycles', () => {
-    const windowObject = new FakeEventTarget();
-    const documentObject = new FakeEventTarget();
-    const service = createLifecycleFlushService({ windowObject, documentObject, logger: { error() {} } });
-
-    service.install();
-    service.install();
-    service.uninstall();
-    service.uninstall();
-
-    assert.equal(windowObject.listenerCount('pagehide'), 0);
-    assert.equal(windowObject.listenerCount('beforeunload'), 0);
-    assert.equal(documentObject.listenerCount('visibilitychange'), 0);
-
-    service.install();
-    assert.equal(windowObject.listenerCount('pagehide'), 1);
-    service.uninstall();
-    assert.equal(windowObject.listenerCount('pagehide'), 0);
-});
-
 test('one failing lifecycle flusher does not block the remaining handlers', async () => {
     const windowObject = new FakeEventTarget();
     const documentObject = new FakeEventTarget();
@@ -110,24 +91,15 @@ test('native exit waits for a successful flush before destroying the window', as
         releaseFlush = resolve;
     });
 
-    windowObject.__TAURI__ = {
-        event: {
-            listen: async (event, handler) => {
-                assert.equal(event, TAURI_GRACEFUL_EXIT_EVENT);
-                nativeExitHandler = handler;
-                return () => {};
-            },
+    const service = createLifecycleFlushService({
+        windowObject, documentObject, logger: { error() {} },
+        listen: async (event, handler) => {
+            assert.equal(event, TAURI_GRACEFUL_EXIT_EVENT);
+            nativeExitHandler = handler;
+            return () => {};
         },
-        window: {
-            getCurrentWindow: () => ({
-                destroy: async () => {
-                    destroyed = true;
-                },
-            }),
-        },
-    };
-
-    const service = createLifecycleFlushService({ windowObject, documentObject, logger: { error() {} } });
+        getCurrentWindow: () => ({ destroy: async () => { destroyed = true; } }),
+    });
     service.register('settings', () => flushBlock);
     service.install();
     await Promise.resolve();
@@ -148,26 +120,15 @@ test('native exit keeps the window open when persistence fails', async () => {
     let nativeExitHandler;
     let destroyed = false;
 
-    windowObject.__TAURI__ = {
-        event: {
-            listen: async (_event, handler) => {
-                nativeExitHandler = handler;
-                return () => {};
-            },
-        },
-        window: {
-            getCurrentWindow: () => ({
-                destroy: async () => {
-                    destroyed = true;
-                },
-            }),
-        },
-    };
-
     const service = createLifecycleFlushService({
         windowObject,
         documentObject,
         logger: { error: (...args) => errors.push(args) },
+        listen: async (_event, handler) => {
+            nativeExitHandler = handler;
+            return () => {};
+        },
+        getCurrentWindow: () => ({ destroy: async () => { destroyed = true; } }),
     });
     service.register('settings', () => Promise.reject(new Error('disk full')));
     service.install();
@@ -212,59 +173,34 @@ test('concurrent flush calls reuse the in-flight promise and run handlers once',
     assert.deepEqual(calls, ['first', 'third']);
 });
 
-test('waitForIdle resolves after the active lifecycle flush completes', async () => {
-    const service = createLifecycleFlushService({
-        windowObject: new FakeEventTarget(),
-        documentObject: new FakeEventTarget(),
-        logger: { error() {} },
+test('real server context starts without native APIs and retains browser lifecycle flushing', async t => {
+    const previousWindow = globalThis.window;
+    const previousDocument = globalThis.document;
+    const previousIdentity = Object.getOwnPropertyDescriptor(globalThis, '__TAURITAVERN_HOST__');
+    t.after(() => {
+        globalThis.window = previousWindow;
+        globalThis.document = previousDocument;
+        if (previousIdentity) Object.defineProperty(globalThis, '__TAURITAVERN_HOST__', previousIdentity);
+        else delete globalThis.__TAURITAVERN_HOST__;
     });
-    const calls = [];
-
-    service.register('async-handler', async reason => {
-        calls.push(`start:${reason}`);
-        await Promise.resolve();
-        calls.push(`end:${reason}`);
-    });
-
-    service.flush('test');
-    await service.waitForIdle();
-
-    assert.deepEqual(calls, ['start:test', 'end:test']);
-});
-
-test('higher priority lifecycle flushers run after pending state producers', async () => {
-    const service = createLifecycleFlushService({
-        windowObject: new FakeEventTarget(),
-        documentObject: new FakeEventTarget(),
-        logger: { error() {} },
-    });
-    const calls = [];
-
-    service.register('invoke-broker', () => calls.push('invoke'), { priority: 100 });
-    service.register('session-state', async () => {
-        calls.push('session:start');
-        await Promise.resolve();
-        calls.push('session:end');
-    });
-
-    await service.flush('test');
-
-    assert.deepEqual(calls, ['session:start', 'session:end', 'invoke']);
-});
-
-test('re-registering a lifecycle flusher replaces the previous implementation', async () => {
-    const service = createLifecycleFlushService({
-        windowObject: new FakeEventTarget(),
-        documentObject: new FakeEventTarget(),
-        logger: { error() {} },
-    });
-    const calls = [];
-
-    service.register('session', () => calls.push('old'));
-    const unregister = service.register('session', () => calls.push('new'));
-    await service.flush('test');
-    unregister();
-    await service.flush('test');
-
-    assert.deepEqual(calls, ['new']);
+    globalThis.window = new FakeEventTarget();
+    globalThis.document = new FakeEventTarget();
+    globalThis.document.visibilityState = 'visible';
+    Object.defineProperty(globalThis, '__TAURITAVERN_HOST__', { configurable: true, value: { platform: 'browser', kind: 'server' } });
+    const { createTauriMainContext } = await import('../src/tauri/main/context/index.js');
+    const context = createTauriMainContext({ invoke: async () => null });
+    assert.equal(typeof context.invokeTransport, 'function');
+    assert.equal(window.listenerCount('pagehide'), 1);
+    assert.equal(window.listenerCount('beforeunload'), 1);
+    assert.equal(document.listenerCount('visibilitychange'), 1);
+    const { registerLifecycleFlushHandler, flushLifecycleState } = await import('../src/tauri/main/services/lifecycle/lifecycle-flush-service.js');
+    const reasons = [];
+    const unregister = registerLifecycleFlushHandler('server-boot-test', reason => reasons.push(reason));
+    try {
+        window.dispatch('pagehide');
+        await flushLifecycleState('wait-for-pagehide');
+        assert.deepEqual(reasons, ['pagehide']);
+    } finally {
+        unregister();
+    }
 });

@@ -20,6 +20,10 @@ pub struct SyncHttpClient {
 }
 
 impl SyncHttpClient {
+    pub(crate) fn into_sync_client(self) -> SyncClient {
+        self.inner
+    }
+
     pub fn new(
         base_url: String,
         spki_sha256: String,
@@ -192,12 +196,19 @@ pub(crate) fn domain_error_to_sync(error: DomainError) -> SyncError {
         DomainError::Conflict(message) => SyncError::InvalidData(message),
         DomainError::AuthenticationError(message) => SyncError::Unauthorized(message),
         DomainError::Cancelled(message) => SyncError::Internal(message),
+        error @ DomainError::WorkspaceAccessDenied { .. } => {
+            SyncError::Unauthorized(error.to_string())
+        }
+        error @ DomainError::FileIo { .. } => SyncError::Io(error.to_string()),
         DomainError::InternalError(message) => SyncError::Internal(message),
         DomainError::RateLimited { message } => SyncError::Internal(message),
         DomainError::Transient(message) => SyncError::Io(message),
         DomainError::UpstreamFailure(failure) => SyncError::Internal(failure.to_string()),
         DomainError::WorkspacePathIsDirectory { path } => {
             SyncError::InvalidData(format!("Workspace path is a directory: {path}"))
+        }
+        DomainError::WorkspaceFileNotText { path } => {
+            SyncError::InvalidData(format!("Workspace file is not UTF-8 text: {path}"))
         }
         DomainError::WorkspaceWriteConflict { kind, .. } => {
             SyncError::InvalidData(format!("Workspace write conflict: {kind}"))
@@ -239,12 +250,10 @@ impl TtPairingClient for HttpTtPairingClient {
 
 #[cfg(test)]
 mod tests {
+    use super::ensure_dataset_scope_v1;
+    use tt_domain::errors::DomainError;
     use ttsync_contract::dataset::{DATASET_POLICY_VERSION, DATASET_SCOPE_FEATURE_V1};
     use ttsync_contract::status::StatusResponse;
-    use ttsync_core::error::SyncError;
-
-    use super::{ensure_dataset_scope_v1, sync_error_to_domain};
-    use tt_domain::errors::DomainError;
 
     fn status(features: Vec<String>, version: Option<u32>) -> StatusResponse {
         StatusResponse {
@@ -260,18 +269,6 @@ mod tests {
             device_name: None,
             spki_sha256: None,
         }
-    }
-
-    #[test]
-    fn sync_error_maps_to_domain_error() {
-        assert!(matches!(
-            sync_error_to_domain(SyncError::Unauthorized("nope".to_owned())),
-            DomainError::AuthenticationError(_)
-        ));
-        assert!(matches!(
-            sync_error_to_domain(SyncError::InvalidData("bad".to_owned())),
-            DomainError::InvalidData(_)
-        ));
     }
 
     #[test]

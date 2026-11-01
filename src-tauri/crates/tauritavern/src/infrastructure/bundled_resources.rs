@@ -1,7 +1,7 @@
 use tauri::AppHandle;
 
 use crate::infrastructure::assets::{
-    list_default_content_files_under, read_resource_bytes, read_resource_text,
+    list_default_files_under, read_resource_bytes, read_resource_text,
 };
 use tt_domain::errors::DomainError;
 use tt_ports::bundled_resource::BundledResourceStore as BundledResourcePort;
@@ -34,6 +34,6 @@ impl BundledResourcePort for BundledResourceStore {
     }
 
     fn list_default_content_files_under(&self, prefix: &str) -> Vec<String> {
-        list_default_content_files_under(prefix)
+        list_default_files_under("content", prefix)
     }
 }
