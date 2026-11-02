@@ -39,6 +39,8 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 COPY src-tauri ./src-tauri
+# Embedded by tt-adapter-media at compile time.
+COPY default/content/user-default.png ./default/content/user-default.png
 
 RUN cargo build \
       --locked \
