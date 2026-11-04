@@ -9,7 +9,7 @@
 In `tauritavern-server` browser sessions (`isServerEnv()`), product settings do not request native runtime paths or offer data-root selection, close-to-tray, or native LAN sync. Chat backup storage statistics use the same `SettingsService`/`FileChatRepository` query as the desktop host via `get_chat_backup_storage_stats` over HTTP RPC; `null` means statistics are currently unavailable.
 The TauriTavern Settings button is installed in both hosts; only native hosts install the pairing and sync event listeners.
 
-Frontend log capture and its viewer remain available. Backend/LLM log viewers and debug-bundle export require desktop log stores backed by Tauri `AppHandle` and event emission, so their buttons are hidden in server mode. `/backendlog` and `/llmlog` (including `/apilog`) remain registered and return an informational “not available in server mode” message, without attempting native devlog RPCs.
+Frontend, backend and LLM API log viewers are available in both hosts, including `/backendlog` and `/llmlog` (`/apilog`). The server keeps backend logs in a process-wide in-memory ring (last 800 entries, same filter as stdout) and the last `dev.llm_api_keep` LLM exchanges in memory (redacted like the server console log; lost on restart). The browser has no host event channel, so `api.dev.backendLogs.subscribe` and `api.dev.llmApiLogs.subscribeIndex` poll the tail once per second by `id` instead of listening for Tauri events. Debug-bundle export still requires the desktop log store and stays hidden in server mode.
 
 ---
 

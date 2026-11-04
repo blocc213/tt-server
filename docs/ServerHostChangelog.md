@@ -14,6 +14,7 @@
 - 原生 Channel 依赖的 Agent 实时投影/运行交互与浏览器扩展工具回调在服务器界面明确提示不可用；不伪装空成功。MCP、SearXNG、vector 等无 Channel 的服务沿共享实现接入。
 - 自定义网络端点使用 upstream 访问许可模型；服务器许可记录位于专用 `.server-security`，不包含于导出且归档导入拒绝该路径，避免从归档授予网络权限。
 - 真实浏览器启动不注册 native graceful-exit 监听，但保留 pagehide/beforeunload 的持久化 flush。核心模板和扩展模板由 `read_frontend_template` / `read_frontend_extension_template` 共享模板服务读取；模板资源限定于前端目录，拒绝路径穿越与符号链接越界。
+- 浏览器支持 `/backendlog`、`/llmlog`（`/apilog`）与设置页对应按钮：服务器在内存保留最近 800 条后端日志（与 stdout 同一过滤）和最近 `dev.llm_api_keep` 条 LLM 请求/响应（与控制台日志相同脱敏，重启即清空），前端以 1 s 轮询按 `id` 增量拉取代替 Tauri 事件。调试包导出仍不暴露。
 
 
 ## 一、基础架构

@@ -117,6 +117,10 @@ const EXPOSED_COMMANDS: &[&str] = &[
     "list_extension_store_keys",
     "delete_extension_store_table",
     "devlog_append_frontend_logs",
+    "devlog_get_backend_log_tail",
+    "devlog_get_llm_api_log_index",
+    "devlog_get_llm_api_log_preview",
+    "devlog_get_llm_api_log_raw",
     "chat_history_generation_started",
     "chat_history_generation_finished",
     "create_settings_snapshot",
@@ -770,6 +774,26 @@ async fn run(state: &Arc<AppState>, command: &str, args: Value) -> Handled {
             }
             ok(Value::Null)
         }
+        "devlog_get_backend_log_tail" => ok(crate::dev_logs::BACKEND_LOGS
+            .tail(opt_arg::<u32>(&args, "limit")?.unwrap_or(800) as usize)),
+        "devlog_get_llm_api_log_index" => ok(state
+            .services
+            .llm_api_logs
+            .index(opt_arg::<u32>(&args, "limit")?.unwrap_or(50).max(1) as usize)),
+        "devlog_get_llm_api_log_preview" => {
+            let id: u64 = arg(&args, "id")?;
+            state.services.llm_api_logs.preview(id).map_or_else(
+                || Err(ServerError::NotFound(format!("LLM API log {id} is no longer kept"))),
+                ok,
+            )
+        }
+        "devlog_get_llm_api_log_raw" => {
+            let id: u64 = arg(&args, "id")?;
+            state.services.llm_api_logs.raw(id).map_or_else(
+                || Err(ServerError::NotFound(format!("LLM API log {id} is no longer kept"))),
+                ok,
+            )
+        }
 
         // ---- settings --------------------------------------------------------------
 
@@ -998,6 +1022,10 @@ async fn run(state: &Arc<AppState>, command: &str, args: Value) -> Handled {
                 .set_avatar_persona_original_images_enabled(
                     settings.avatar_persona_original_images_enabled,
                 );
+            state
+                .services
+                .llm_api_logs
+                .set_keep(settings.dev.llm_api_keep);
             if retention_changed {
                 state
                     .services

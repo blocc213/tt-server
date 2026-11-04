@@ -12,6 +12,7 @@ mod rpc_services;
 mod chat;
 mod composition;
 mod config;
+mod dev_logs;
 mod error;
 mod generate;
 mod http;
@@ -37,11 +38,15 @@ use crate::state::AppState;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
+    use tracing_subscriber::prelude::*;
+    // The env filter is global so `/backendlog` shows exactly what stdout shows.
+    tracing_subscriber::registry()
+        .with(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| "info,tauritavern_server=debug".into()),
         )
+        .with(tracing_subscriber::fmt::layer())
+        .with(dev_logs::BackendLogLayer)
         .init();
 
     let mut args = Args::parse();

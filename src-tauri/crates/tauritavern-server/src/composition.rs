@@ -131,6 +131,7 @@ pub struct ServerServices {
     pub database_service: Arc<tt_application::services::database_service::DatabaseService>,
     pub user_endpoint_access_service: Arc<tt_application::services::user_endpoint_access_service::UserEndpointAccessService>,
     pub archive_files: Arc<ServerDataArchiveFiles>,
+    pub llm_api_logs: Arc<crate::dev_logs::LlmApiLogStore>,
 }
 
 const COMMIT_FRAME_BYTES: u64 = 4 * 1024 * 1024;
@@ -226,9 +227,13 @@ pub async fn build(
         data_root.join("_tauritavern").join("prompt-cache"),
     ));
 
+    let llm_api_logs = Arc::new(crate::dev_logs::LlmApiLogStore::new(
+        settings.dev.effective_llm_api_keep(),
+    ));
     let chat_completion_repository =
         Arc::new(crate::llm_logging::ConsoleChatCompletionRepository::new(
             Arc::new(HttpChatCompletionRepository::new(http_client_pool.clone())),
+            llm_api_logs.clone(),
         ));
     let provider_metadata_service = Arc::new(ProviderMetadataService::new(
         Arc::new(HttpProviderMetadataRepository::new(
@@ -522,6 +527,7 @@ pub async fn build(
         sprite_service, mcp_service, searxng_search_service, vector_service, database_service,
         user_endpoint_access_service,
         archive_files,
+        llm_api_logs,
         data_archive_service,
         ios_policy,
     })

@@ -383,8 +383,8 @@ function SettingsApp({
                     <ActionButton label={tr('Manage Quick Access')} icon="fa-magic-wand-sparkles" onClick={() => void actions.manageQuickAccess()} />
                     <ActionButton label={tr('Reload Frontend')} icon="fa-arrows-rotate" onClick={() => void actions.reloadFrontend()} />
                     <ActionButton label={tr('Frontend Logs')} icon="fa-terminal" onClick={() => void actions.openFrontendLogs()} />
-                    {!actions.backgroundGeneration && <ActionButton label={tr('Backend Logs')} icon="fa-server" onClick={() => void actions.openBackendLogs()} />}
-                    {!actions.backgroundGeneration && <ActionButton label={tr('LLM API Logs')} icon="fa-file-lines" onClick={() => void actions.openLlmApiLogs()} />}
+                    <ActionButton label={tr('Backend Logs')} icon="fa-server" onClick={() => void actions.openBackendLogs()} />
+                    <ActionButton label={tr('LLM API Logs')} icon="fa-file-lines" onClick={() => void actions.openLlmApiLogs()} />
                 </div>
             </SettingsSection>
 

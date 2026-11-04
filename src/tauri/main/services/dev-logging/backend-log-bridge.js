@@ -1,5 +1,7 @@
 // @ts-check
 
+import { isServerEnv } from '../../../../tauri-bridge.js';
+import { createPollingSubscribe } from './polling-stream.js';
 import { createTauriEventStreamBridge } from './tauri-event-stream-bridge.js';
 
 const BACKEND_LOG_EVENT = 'tauritavern-backend-log';
@@ -21,23 +23,25 @@ function requirePositiveInteger(value, label) {
  * @param {{ safeInvoke: (command: any, args?: any) => Promise<any> }} deps
  */
 export function createBackendLogBridge({ safeInvoke }) {
-    const stream = createTauriEventStreamBridge({
-        safeInvoke,
-        enableCommand: 'devlog_set_backend_log_stream_enabled',
-        eventName: BACKEND_LOG_EVENT,
-    });
+    /** @param {number} limit */
+    const tail = limit => safeInvoke('devlog_get_backend_log_tail', { limit });
+    const subscribe = isServerEnv()
+        ? createPollingSubscribe(() => tail(DEFAULT_BACKEND_LOG_TAIL_LIMIT))
+        : createTauriEventStreamBridge({
+            safeInvoke,
+            enableCommand: 'devlog_set_backend_log_stream_enabled',
+            eventName: BACKEND_LOG_EVENT,
+        }).subscribe;
 
     return {
         /**
          * @param {{ limit?: number }} [options]
          */
         async tail(options = {}) {
-            const limit = options?.limit === undefined
+            return tail(options?.limit === undefined
                 ? DEFAULT_BACKEND_LOG_TAIL_LIMIT
-                : requirePositiveInteger(options.limit, 'limit');
-
-            return safeInvoke('devlog_get_backend_log_tail', { limit });
+                : requirePositiveInteger(options.limit, 'limit'));
         },
-        subscribe: stream.subscribe,
+        subscribe,
     };
 }

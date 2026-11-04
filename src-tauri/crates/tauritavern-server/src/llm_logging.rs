@@ -1,9 +1,13 @@
 //! Foreground server logs intentionally include complete prompts and responses.
+//! The same redacted exchanges feed the `/llmlog` viewer through `dev_logs`.
 use std::sync::Arc;
 use std::time::Instant;
 
 use async_trait::async_trait;
 use serde_json::Value;
+use tt_application::dto::dev_observability_dto::{
+    LlmApiLogPreviewDto, LlmApiLogRawDto, LlmApiRawKindDto,
+};
 use tt_domain::errors::DomainError;
 use tt_ports::repositories::chat_completion_repository::{
     CHAT_COMPLETION_PROVIDER_STATE_FIELD, ChatCompletionApiConfig, ChatCompletionCancelReceiver,
@@ -11,13 +15,78 @@ use tt_ports::repositories::chat_completion_repository::{
     ChatCompletionStreamSender, ChatCompletionStreamDelta,
 };
 
+use crate::dev_logs::{LlmApiLogEntry, LlmApiLogStore};
+
 pub struct ConsoleChatCompletionRepository {
     inner: Arc<dyn ChatCompletionRepository>,
+    logs: Arc<LlmApiLogStore>,
 }
 
 impl ConsoleChatCompletionRepository {
-    pub fn new(inner: Arc<dyn ChatCompletionRepository>) -> Self {
-        Self { inner }
+    pub fn new(inner: Arc<dyn ChatCompletionRepository>, logs: Arc<LlmApiLogStore>) -> Self {
+        Self { inner, logs }
+    }
+}
+
+/// One exchange as the `/llmlog` viewer shows it.
+struct Exchange<'a> {
+    source: ChatCompletionSource,
+    config: &'a ChatCompletionApiConfig,
+    endpoint_path: &'a str,
+    payload: &'a Value,
+    started: Instant,
+    started_at_ms: i64,
+    stream: bool,
+}
+
+impl<'a> Exchange<'a> {
+    fn start(
+        source: ChatCompletionSource,
+        config: &'a ChatCompletionApiConfig,
+        endpoint_path: &'a str,
+        payload: &'a Value,
+        stream: bool,
+    ) -> Self {
+        Self {
+            source,
+            config,
+            endpoint_path,
+            payload,
+            started: Instant::now(),
+            started_at_ms: chrono::Utc::now().timestamp_millis(),
+            stream,
+        }
+    }
+
+    /// `response` is the redacted body and its wire kind; `Err` carries the failure.
+    fn into_entry(self, response: Result<(String, LlmApiRawKindDto), &DomainError>) -> LlmApiLogEntry {
+        let request = pretty(self.payload, Some(self.config));
+        let (ok, level, error_message, response_raw, response_raw_kind) = match response {
+            Ok((body, kind)) => (true, "INFO", None, body, Some(kind)),
+            Err(error) => {
+                let level = if matches!(error, DomainError::Cancelled(_)) { "WARN" } else { "ERROR" };
+                (false, level, Some(redacted_error(error, self.config)), String::new(), None)
+            }
+        };
+        let preview = LlmApiLogPreviewDto {
+            id: 0,
+            timestamp_ms: self.started_at_ms,
+            level: level.to_string(),
+            ok,
+            source: self.source.key().to_string(),
+            model: self.payload.get("model").and_then(Value::as_str).map(str::to_string),
+            endpoint: endpoint(self.config, self.endpoint_path),
+            duration_ms: self.started.elapsed().as_millis().min(u128::from(u32::MAX)) as u32,
+            stream: self.stream,
+            response_readable: error_message.clone().unwrap_or_else(|| response_raw.clone()),
+            error_message,
+            request_readable: request.clone(),
+            response_raw_kind,
+        };
+        LlmApiLogEntry {
+            raw: LlmApiLogRawDto { id: 0, request_raw: request, response_raw, response_raw_kind },
+            preview,
+        }
     }
 }
 
@@ -83,16 +152,8 @@ pub(crate) fn pretty(value: &Value, config: Option<&ChatCompletionApiConfig>) ->
     serde_json::to_string_pretty(&value).expect("JSON value serialization")
 }
 
-fn log_request(
-    source: ChatCompletionSource,
-    config: &ChatCompletionApiConfig,
-    endpoint: &str,
-    payload: &Value,
-) {
-    if !tracing::enabled!(target: "tauritavern_server::llm", tracing::Level::INFO) {
-        return;
-    }
-    // URL credentials and query strings may contain secrets; never print them.
+/// Provider URL without userinfo, query, or fragment: they may carry secrets.
+fn endpoint(config: &ChatCompletionApiConfig, endpoint_path: &str) -> String {
     let base = config.base_url.split(['?', '#']).next().unwrap_or_default();
     let base = match base.split_once("://") {
         Some((scheme, rest)) => {
@@ -100,10 +161,31 @@ fn log_request(
         }
         None => "[invalid endpoint]".into(),
     };
+    let url = format!("{}{}", base.trim_end_matches('/'),
+        endpoint_path.split(['?', '#']).next().unwrap_or_default());
+    let mut url = Value::String(url);
+    redact(&mut url, Some(config));
+    url.as_str().unwrap_or_default().to_string()
+}
+
+fn redacted_error(error: &DomainError, config: &ChatCompletionApiConfig) -> String {
+    let mut error = Value::String(error.to_string().replace(&config.base_url, "[provider endpoint]"));
+    redact(&mut error, Some(config));
+    error.as_str().unwrap_or_default().to_string()
+}
+
+fn log_request(
+    source: ChatCompletionSource,
+    config: &ChatCompletionApiConfig,
+    endpoint_path: &str,
+    payload: &Value,
+) {
+    if !tracing::enabled!(target: "tauritavern_server::llm", tracing::Level::INFO) {
+        return;
+    }
     tracing::info!(target: "tauritavern_server::llm", source = source.key(),
         model = %pretty(payload.get("model").unwrap_or(&serde_json::Value::Null), Some(config)),
-        "Chat Completion request: {}\n{}", pretty(&serde_json::Value::String(format!("{}{}", base.trim_end_matches('/'),
-        endpoint.split(['?', '#']).next().unwrap_or_default())), Some(config)), pretty(payload, Some(config)));
+        "Chat Completion request: {}\n{}", endpoint(config, endpoint_path), pretty(payload, Some(config)));
 }
 
 fn log_result<T>(
@@ -118,12 +200,28 @@ fn log_result<T>(
             "Chat Completion completed")
         }
         Err(error) => {
-            let error = error
-                .to_string()
-                .replace(&config.base_url, "[provider endpoint]");
             tracing::error!(target: "tauritavern_server::llm", duration_ms = started.elapsed().as_millis() as u64, chunks,
-            "Chat Completion failed: {}", pretty(&serde_json::Value::String(error), Some(config)))
+            "Chat Completion failed: {}", redacted_error(error, config))
         }
+    }
+}
+
+impl ConsoleChatCompletionRepository {
+    fn finish_json(
+        &self,
+        exchange: Exchange<'_>,
+        result: &Result<ChatCompletionRepositoryGenerateResponse, DomainError>,
+    ) {
+        let response = match result {
+            Ok(response) => {
+                let body = pretty(&response.body, Some(exchange.config));
+                tracing::info!(target: "tauritavern_server::llm", "Chat Completion response:\n{body}");
+                Ok((body, LlmApiRawKindDto::Json))
+            }
+            Err(error) => Err(error),
+        };
+        log_result(result, exchange.started, exchange.config, None);
+        self.logs.record(exchange.into_entry(response));
     }
 }
 
@@ -144,18 +242,13 @@ impl ChatCompletionRepository for ConsoleChatCompletionRepository {
         endpoint_path: &str,
         payload: &Value,
     ) -> Result<ChatCompletionRepositoryGenerateResponse, DomainError> {
-        let started = Instant::now();
+        let exchange = Exchange::start(source, config, endpoint_path, payload, false);
         log_request(source, config, endpoint_path, payload);
         let result = self
             .inner
             .generate(source, config, endpoint_path, payload)
             .await;
-        if tracing::enabled!(target: "tauritavern_server::llm", tracing::Level::INFO)
-            && let Ok(response) = &result
-        {
-            tracing::info!(target: "tauritavern_server::llm", "Chat Completion response:\n{}", pretty(&response.body, Some(config)));
-        }
-        log_result(&result, started, config, None);
+        self.finish_json(exchange, &result);
         result
     }
 
@@ -168,23 +261,35 @@ impl ChatCompletionRepository for ConsoleChatCompletionRepository {
         sender: ChatCompletionStreamSender,
         cancel: ChatCompletionCancelReceiver,
     ) -> Result<(), DomainError> {
-        let started = Instant::now();
+        let exchange = Exchange::start(source, config, endpoint_path, payload, true);
         log_request(source, config, endpoint_path, payload);
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
         let forward = async move {
             let mut chunks = 0;
+            let mut sse = String::new();
             while let Some(chunk) = rx.recv().await {
                 chunks += 1;
+                sse.push_str(&chunk);
+                sse.push('\n');
                 let _ = sender.send(chunk);
             }
-            chunks
+            (chunks, sse)
         };
-        let (result, chunks) = tokio::join!(
+        let (result, (chunks, sse)) = tokio::join!(
             self.inner
                 .generate_stream(source, config, endpoint_path, payload, tx, cancel),
             forward
         );
-        log_result(&result, started, config, Some(chunks));
+        log_result(&result, exchange.started, config, Some(chunks));
+        let response = match &result {
+            Ok(()) => {
+                let mut sse = Value::String(sse);
+                redact(&mut sse, Some(config));
+                Ok((sse.as_str().unwrap_or_default().to_string(), LlmApiRawKindDto::Sse))
+            }
+            Err(error) => Err(error),
+        };
+        self.logs.record(exchange.into_entry(response));
         result
     }
 
@@ -196,15 +301,10 @@ impl ChatCompletionRepository for ConsoleChatCompletionRepository {
         payload: &Value,
         on_delta: &mut (dyn FnMut(ChatCompletionStreamDelta) + Send),
     ) -> Result<ChatCompletionRepositoryGenerateResponse, DomainError> {
-        let started = Instant::now();
+        let exchange = Exchange::start(source, config, endpoint_path, payload, true);
         log_request(source, config, endpoint_path, payload);
         let result = self.inner.generate_with_deltas(source, config, endpoint_path, payload, on_delta).await;
-        if tracing::enabled!(target: "tauritavern_server::llm", tracing::Level::INFO)
-            && let Ok(response) = &result
-        {
-            tracing::info!(target: "tauritavern_server::llm", "Chat Completion response:\n{}", pretty(&response.body, Some(config)));
-        }
-        log_result(&result, started, config, None);
+        self.finish_json(exchange, &result);
         result
     }
 

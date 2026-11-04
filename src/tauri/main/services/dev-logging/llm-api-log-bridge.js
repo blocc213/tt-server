@@ -1,5 +1,7 @@
 // @ts-check
 
+import { isServerEnv } from '../../../../tauri-bridge.js';
+import { createPollingSubscribe } from './polling-stream.js';
 import { createTauriEventStreamBridge } from './tauri-event-stream-bridge.js';
 
 const LLM_API_LOG_EVENT = 'tauritavern-llm-api-log';
@@ -20,11 +22,14 @@ function requirePositiveInteger(value, label) {
  * @param {{ safeInvoke: (command: any, args?: any) => Promise<any> }} deps
  */
 export function createLlmApiLogBridge({ safeInvoke }) {
-    const stream = createTauriEventStreamBridge({
-        safeInvoke,
-        enableCommand: 'devlog_set_llm_api_log_stream_enabled',
-        eventName: LLM_API_LOG_EVENT,
-    });
+    // New entries are always at the tail, so a fixed window finds them for any keep.
+    const subscribeIndex = isServerEnv()
+        ? createPollingSubscribe(() => safeInvoke('devlog_get_llm_api_log_index', { limit: 50 }))
+        : createTauriEventStreamBridge({
+            safeInvoke,
+            enableCommand: 'devlog_set_llm_api_log_stream_enabled',
+            eventName: LLM_API_LOG_EVENT,
+        }).subscribe;
 
     return {
         /**
@@ -55,6 +60,6 @@ export function createLlmApiLogBridge({ safeInvoke }) {
                 id: requirePositiveInteger(id, 'id'),
             });
         },
-        subscribeIndex: stream.subscribe,
+        subscribeIndex,
     };
 }
